@@ -36,6 +36,7 @@
 - Python 3.10+
 - ffmpeg 4.4+
 - Magewell ProCapture driver (for Magewell cards)
+- magewell2ts binary (for Magewell cards) — see below
 - ADB (optional, for Android TV control)
 
 ---
@@ -46,7 +47,7 @@
 
 ```bash
 sudo apt update
-sudo apt install -y python3 python3-pip ffmpeg adb
+sudo apt install -y python3 python3-pip ffmpeg adb build-essential cmake libv4l-dev libudev-dev
 ```
 
 ### 2. Install Python dependencies
@@ -55,14 +56,62 @@ sudo apt install -y python3 python3-pip ffmpeg adb
 pip3 install -r requirements.txt --break-system-packages
 ```
 
-### 3. Install the Magewell driver
+### 3. Install the Magewell driver and magewell2ts
 
-Download the ProCapture driver from [magewell.com/downloads/pro-capture](https://www.magewell.com/downloads/pro-capture), extract it to a permanent location, then run:
+BroadcastHub uses the [magewell2ts](https://github.com/jpoet/Magewell2TS) application by jpoet to interface with Magewell Pro Capture cards. This requires both the Magewell ProCapture driver and the magewell2ts binary to be installed.
+
+#### 3a. Install the Magewell ProCapture driver
+
+Download the Linux driver from the Magewell website:
+
+- **Pro Capture:** https://www.magewell.com/downloads/pro-capture#/driver/linux-x86
+- **Eco Capture:** https://www.magewell.com/downloads/eco-capture#/driver/linux-x86
+
+Extract and install to a **permanent location** — BroadcastHub needs this path for automatic reinstallation after kernel updates:
 
 ```bash
+mkdir -p ~/src/Magewell
+tar -xzf ProCaptureForLinux_*.tar.gz -C ~/src/Magewell
 cd ~/src/Magewell/ProCaptureForLinux_x.x.xxxx
 sudo ./install.sh
 ```
+
+Verify the driver loaded:
+
+```bash
+lsmod | grep ProCapture
+```
+
+> **Note:** On newer kernels it may be necessary to add `ibt=off` to kernel parameters:
+> ```bash
+> sudo grubby --update-kernel=ALL --args="ibt=off"
+> ```
+
+#### 3b. Install magewell2ts
+
+magewell2ts reads directly from the Magewell API and outputs MPEG-TS to stdout. Full build instructions are at https://github.com/jpoet/Magewell2TS — a summary for Ubuntu follows.
+
+Download the Magewell Capture SDK from https://www.magewell.com/sdk, then:
+
+```bash
+mkdir -p ~/src/Magewell
+cd ~/src/Magewell
+tar -xzf Magewell_Capture_SDK_Linux_*.tar.gz
+git clone https://github.com/jpoet/Magewell2TS.git
+cd Magewell2TS
+mkdir build && cd build
+cmake ..
+make
+sudo make install
+```
+
+Verify the install:
+
+```bash
+magewell2ts --list
+```
+
+You should see your capture cards listed.
 
 ### 4. Run one-time setup
 
@@ -96,6 +145,12 @@ Run `sudo ./setup.sh` once to configure the passwordless sudo rule that makes th
 
 ---
 
+## Decklink Support
+
+Decklink cards are supported via ffmpeg's decklink input device. No additional binaries are required beyond ffmpeg compiled with Decklink support. Decklink inputs are auto-detected at startup.
+
+---
+
 ## File Reference
 
 | File | Purpose |
@@ -110,9 +165,17 @@ Run `sudo ./setup.sh` once to configure the passwordless sudo rule that makes th
 
 ---
 
+## Related Projects
+
+- [magewell2ts](https://github.com/jpoet/Magewell2TS) by jpoet — the capture binary BroadcastHub uses to interface with Magewell Pro Capture cards
+- [ah4c](https://github.com/sullrich/ah4c) — Android HDMI for Channels, recommended companion for tuning Android TV streaming devices
+
+---
+
 ## Acknowledgements
 
 Built with assistance from [Claude](https://claude.ai) (Anthropic) — AI pair programmer for architecture, implementation, and debugging.
+Conceptualized initially by @istwok on Chanels DVR forums. 
 
 ---
 
