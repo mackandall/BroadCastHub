@@ -1,6 +1,6 @@
 # BroadcastHub
 
-**BroadcastHub** is a self-hosted web application for managing professional video capture hardware. It provides a browser-based dashboard for monitoring live inputs, recording to disk, scheduling recordings, streaming via HLS to mobile devices, and controlling Android TV source devices via ADB.
+**BroadcastHub** is a self-hosted web application for managing video magewell and decklink capture hardware. It provides a browser-based dashboard for monitoring live inputs, recording to disk, scheduling recordings, streaming via HLS to mobile devices, and controlling Android TV source devices via ADB if needed.
 
 ---
 
@@ -9,8 +9,8 @@
 - **Multi-input dashboard** — monitor all Magewell and Decklink capture inputs in real time via SSE
 - **Live streaming** — stream any input as MPEG-TS directly to VLC or any compatible player
 - **HLS broadcasting** — one-click HLS stream for mobile/browser viewing at `/mobile`
-- **Recording** — record to TS, MP4, MKV, or MOV with optional timed duration
-- **Scheduler** — queue recordings with a future start time
+- **Recording** — record to TS, MP4, MKV, or MOV
+- **Scheduler** — queue recordings with a future start time if needed 
 - **Hardware encoding** — supports Intel QSV, NVIDIA NVENC, AMD AMF, VAAPI, and software x264/x265
 - **Android TV control** — built-in ADB remote for navigating source devices
 - **Real-time log viewer** — timestamped, filterable log stream at `/logs`
@@ -32,7 +32,7 @@
 
 ## Requirements
 
-- Ubuntu 22.04 LTS or 24.04 LTS
+- Ubuntu 22.04 LTS or 24.04 LTS (Have not tested with any other flavors of Linux)
 - Python 3.10+
 - ffmpeg 4.4+
 - Magewell ProCapture driver (for Magewell cards)
