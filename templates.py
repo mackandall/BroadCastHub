@@ -24,12 +24,8 @@ def _fmt_elapsed(s: int) -> str:
 def _label(key: str) -> str:
     """Return a human-readable label for an input key.
 
-    Magewell keys are ``"board-channel"`` (e.g. ``"0-1"``).
-    Decklink keys are ``"dl-N"`` (e.g. ``"dl-0"``).
+    Keys are ``"board-channel"`` (e.g. ``"0-1"``).
     """
-    if key.startswith("dl-"):
-        idx = key.split("-", 1)[1]
-        return f"Decklink · Device {idx}"
     b, i = key.split("-", 1)
     return f"Board {b} · Input {i}"
 
@@ -106,7 +102,7 @@ def render_mobile(all_ids: list, live_ids: list, hls_ids: list) -> str:
     already_hls_js  = str([inp["id"] for inp in inputs_info if inp["hls"]]).replace("'", '"')
 
     return (
-        "<!DOCTYPE html><html><head>"
+        "<!DOCTYPE html><html data-theme='dark'><head>"
         '<meta charset="UTF-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">'
         '<meta name="apple-mobile-web-app-capable" content="yes">'
@@ -115,42 +111,78 @@ def render_mobile(all_ids: list, live_ids: list, hls_ids: list) -> str:
         '<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js"></script>'
         "<style>"
         "*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}"
-        "body{background:#080808;color:#f0f0f0;font-family:'Inter',sans-serif;padding-bottom:30px;max-width:480px;margin:0 auto}"
-        ".topbar{padding:16px 16px 12px;border-bottom:1px solid #1a1a1a;position:sticky;top:0;background:rgba(8,8,8,.96);backdrop-filter:blur(14px);display:flex;align-items:center;justify-content:space-between;z-index:50}"
-        ".logo{font-family:'Inter',sans-serif;font-weight:900;font-style:italic;font-size:21px;text-transform:uppercase}"
-        ".logo span{color:#e8ff47}"
-        ".desktop-link{color:#444;font-size:11px;text-decoration:none;text-transform:uppercase;letter-spacing:.1em}"
-        ".section-lbl{padding:16px 14px 8px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.15em;color:#3a3a3a}"
+        ":root,[data-theme=dark]{"
+        "--bg:#090d1a;--bg-topbar:rgba(9,13,26,.97);--surface:#0b0f22;"
+        "--border:#1c2540;--text:#c0cce8;--muted:#3a4870;"
+        "--accent:#00e5ff;--accent-dim:rgba(0,229,255,.18);--accent-bdr:rgba(0,229,255,.4);"
+        "--live:#ff0066;--live-bg:rgba(255,0,102,.15);--live-bdr:rgba(255,0,102,.4);"
+        "--card-bg:#0b0f22;--thumb-bg:#060810;--thumb-num:#1c2540;"
+        "--btn-play-bg:#00e5ff;--btn-play-color:#000;"
+        "--btn-stop-bg:rgba(255,0,102,.15);--btn-stop-bdr:rgba(255,0,102,.35);--btn-stop-color:#ff0066;"
+        "}"
+        "[data-theme=mono]{"
+        "--bg:#100e06;--bg-topbar:rgba(12,10,4,.98);--surface:#0c0a04;"
+        "--border:#2a1e08;--text:#e8d0a0;--muted:#5a3818;"
+        "--accent:#ff6600;--accent-dim:rgba(255,102,0,.18);--accent-bdr:rgba(255,102,0,.45);"
+        "--live:#ff2200;--live-bg:rgba(255,34,0,.15);--live-bdr:rgba(255,34,0,.4);"
+        "--card-bg:#0c0a04;--thumb-bg:#070604;--thumb-num:#2a1e08;"
+        "--btn-play-bg:#ff6600;--btn-play-color:#fff;"
+        "--btn-stop-bg:rgba(255,34,0,.15);--btn-stop-bdr:rgba(255,34,0,.35);--btn-stop-color:#ff2200;"
+        "}"
+        "[data-theme=light]{"
+        "--bg:#f3f5fa;--bg-topbar:rgba(26,31,56,.98);--surface:#fff;"
+        "--border:#c8cedd;--text:#1a1f38;--muted:#6878a8;"
+        "--accent:#4d9fff;--accent-dim:rgba(77,159,255,.15);--accent-bdr:rgba(77,159,255,.45);"
+        "--live:#dc2626;--live-bg:rgba(220,38,38,.1);--live-bdr:rgba(220,38,38,.35);"
+        "--card-bg:#fff;--thumb-bg:#edf0f8;--thumb-num:#c0c8de;"
+        "--btn-play-bg:#4d9fff;--btn-play-color:#fff;"
+        "--btn-stop-bg:rgba(220,38,38,.1);--btn-stop-bdr:rgba(220,38,38,.3);--btn-stop-color:#dc2626;"
+        "}"
+
+        "body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;padding-bottom:30px;max-width:480px;margin:0 auto}"
+        ".topbar{padding:16px 16px 12px;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--bg-topbar);backdrop-filter:blur(14px);display:flex;align-items:center;justify-content:space-between;z-index:50}"
+        ".logo{font-family:'Inter',sans-serif;font-weight:900;font-style:italic;font-size:21px;text-transform:uppercase;color:var(--text)}"
+        ".logo span{color:var(--accent)}"
+        ".desktop-link{color:var(--muted);font-size:11px;text-decoration:none;text-transform:uppercase;letter-spacing:.1em}"
+        ".section-lbl{padding:16px 14px 8px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.15em;color:var(--muted)}"
         ".cards{padding:0 10px;display:flex;flex-direction:column;gap:12px}"
-        ".card{background:#0f0f0f;border:1px solid #1e1e1e;border-radius:4px;overflow:hidden;transition:border-color .2s}"
-        ".card.hls-on{border-color:rgba(232,255,71,.25)}"
-        ".card-media{position:relative;width:100%;aspect-ratio:16/9;background:#060606;overflow:hidden}"
+        ".card{background:var(--card-bg);border:1px solid var(--border);border-radius:4px;overflow:hidden;transition:border-color .2s}"
+        ".card.hls-on{border-color:var(--accent-bdr)}"
+        ".card-media{position:relative;width:100%;aspect-ratio:16/9;background:var(--thumb-bg);overflow:hidden}"
         ".card-media video{width:100%;height:100%;object-fit:contain;display:block;background:#000}"
         ".card-placeholder{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:6px}"
-        ".card-placeholder .big-num{font-family:'Inter',sans-serif;font-weight:900;font-size:36px;color:#1c1c1c;line-height:1}"
-        ".card-placeholder .no-sig{font-family:'Inter',sans-serif;font-weight:700;font-size:10px;text-transform:uppercase;letter-spacing:.15em;color:#2a2a2a}"
+        ".card-placeholder .big-num{font-family:'Inter',sans-serif;font-weight:900;font-size:36px;color:var(--thumb-num);line-height:1}"
+        ".card-placeholder .no-sig{font-family:'Inter',sans-serif;font-weight:700;font-size:10px;text-transform:uppercase;letter-spacing:.15em;color:var(--muted)}"
         ".status-badge{position:absolute;top:10px;left:10px;z-index:5;font-family:'Inter',sans-serif;font-weight:900;font-size:11px;letter-spacing:.1em;text-transform:uppercase;display:flex;align-items:center;gap:5px;padding:3px 9px;border-radius:4px}"
-        ".status-badge.live{background:rgba(255,59,59,.15);border:1px solid rgba(255,59,59,.35);color:#ff3b3b}"
-        ".status-badge.offline{color:#333}"
-        ".blink{width:6px;height:6px;border-radius:50%;background:#ff3b3b;animation:blink 1.4s ease-in-out infinite}"
+        ".status-badge.live{background:var(--live-bg);border:1px solid var(--live-bdr);color:var(--live)}"
+        ".status-badge.offline{color:var(--muted)}"
+        ".blink{width:6px;height:6px;border-radius:50%;background:var(--live);animation:blink 1.4s ease-in-out infinite}"
         "@keyframes blink{0%,100%{opacity:1}50%{opacity:.15}}"
-        ".hls-badge{position:absolute;top:10px;right:10px;z-index:5;background:rgba(232,255,71,.1);border:1px solid rgba(232,255,71,.3);color:#e8ff47;font-family:'Inter',sans-serif;font-weight:900;font-size:10px;letter-spacing:.1em;text-transform:uppercase;padding:3px 9px;border-radius:4px;display:flex;align-items:center;gap:4px}"
-        ".hls-dot{width:5px;height:5px;border-radius:50%;background:#e8ff47;animation:blink 1.4s ease-in-out infinite}"
+        ".hls-badge{position:absolute;top:10px;right:10px;z-index:5;background:var(--accent-dim);border:1px solid var(--accent-bdr);color:var(--accent);font-family:'Inter',sans-serif;font-weight:900;font-size:10px;letter-spacing:.1em;text-transform:uppercase;padding:3px 9px;border-radius:4px;display:flex;align-items:center;gap:4px}"
+        ".hls-dot{width:5px;height:5px;border-radius:50%;background:var(--accent);animation:blink 1.4s ease-in-out infinite}"
         ".loading-cover{position:absolute;inset:0;z-index:4;background:rgba(0,0,0,.7);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;transition:opacity .4s}"
         ".loading-cover.gone{opacity:0;pointer-events:none}"
-        ".spinner{width:30px;height:30px;border:2px solid #1e1e1e;border-top-color:#e8ff47;border-radius:50%;animation:spin .7s linear infinite}"
+        ".spinner{width:30px;height:30px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite}"
         "@keyframes spin{to{transform:rotate(360deg)}}"
-        ".spinner-lbl{font-family:'Inter',sans-serif;font-weight:700;font-size:10px;text-transform:uppercase;letter-spacing:.12em;color:#555}"
-        ".card-foot{padding:12px 14px;display:flex;align-items:center;justify-content:space-between;gap:10px;border-top:1px solid #141414}"
-        ".card-title{font-family:'Inter',sans-serif;font-weight:900;font-size:14px;text-transform:uppercase;letter-spacing:.03em;color:#e8e8e8}"
-        ".card-sub{font-size:11px;color:#444;margin-top:2px;font-weight:500}"
+        ".spinner-lbl{font-family:'Inter',sans-serif;font-weight:700;font-size:10px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted)}"
+        ".card-foot{padding:12px 14px;display:flex;align-items:center;justify-content:space-between;gap:10px;border-top:1px solid var(--border)}"
+        ".card-title{font-family:'Inter',sans-serif;font-weight:900;font-size:14px;text-transform:uppercase;letter-spacing:.03em;color:var(--text)}"
+        ".card-sub{font-size:11px;color:var(--muted);margin-top:2px;font-weight:500}"
         ".btn-row{display:flex;gap:8px;flex-shrink:0}"
-        ".btn{font-family:'Inter',sans-serif;font-weight:900;font-size:13px;text-transform:uppercase;letter-spacing:.07em;padding:9px 20px;border-radius:4px;border:none;cursor:pointer;transition:opacity .15s,background .15s;white-space:nowrap}"
+        ".btn{font-family:'Inter',sans-serif;font-weight:900;font-size:13px;text-transform:uppercase;letter-spacing:.07em;padding:9px 20px;border-radius:4px;border:none;cursor:pointer;transition:opacity .15s;white-space:nowrap}"
         ".btn:active{opacity:.7}"
-        ".btn-play{background:#e8ff47;color:#000}"
-        ".btn-stop{background:rgba(180,40,40,.1);border:1px solid rgba(180,40,40,.3)!important;color:#cc4040}"
+        ".btn-play{background:var(--btn-play-bg);color:var(--btn-play-color)}"
+        ".btn-stop{background:var(--btn-stop-bg);border:1px solid var(--btn-stop-bdr)!important;color:var(--btn-stop-color)}"
         ".btn-stop-dim{opacity:.22;cursor:not-allowed;pointer-events:none}"
-        "</style></head><body>"
+        "</style>"
+        "<script>"
+        "(function(){"
+        "try{var t=localStorage.getItem('bh-theme');"
+        "if(t&&['dark','mono','light'].includes(t))document.documentElement.setAttribute('data-theme',t);"
+        "}catch(e){}"
+        "})();"
+        "</script>"
+        "</head><body>"
         '<div class="topbar"><div class="logo">Broadcast<span>Hub</span></div>'
         '<a href="/" class="desktop-link">Desktop ↗</a></div>'
         '<div class="section-lbl">Live Inputs</div>'
@@ -259,6 +291,625 @@ def render_mobile(all_ids: list, live_ids: list, hls_ids: list) -> str:
 
 
 # ---------------------------------------------------------------------------
+# render_multiview
+# ---------------------------------------------------------------------------
+
+def render_multiview(all_ids: list, live_ids: list, cfg: dict) -> str:
+    """Render the quad multiviewer page.
+
+    Parameters:
+      all_ids  : ordered list of all configured input key strings
+      live_ids : keys currently running in active_inputs
+      cfg      : snapshot of input_config dict (for signal/encoder info)
+    """
+
+    ids_js = str(all_ids).replace("'", '"')
+    live_js = str(live_ids).replace("'", '"')
+
+    # Build label map for JS
+    label_map = {k: _label(k) for k in all_ids}
+    label_js = json.dumps(label_map)
+
+    # Build encoder/signal info map
+    meta_map = {
+        k: {
+            "encoder": cfg.get(k, {}).get("encoder", ""),
+            "signal":  cfg.get(k, {}).get("signal", "UNKNOWN"),
+            "desc":    cfg.get(k, {}).get("desc", ""),
+        }
+        for k in all_ids
+    }
+    meta_js = json.dumps(meta_map)
+
+    return f"""<!DOCTYPE html>
+<html data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Multiview — Broadcast Hub</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap" rel="stylesheet">
+<script>
+  (function(){{
+    try {{
+      var t = localStorage.getItem('bh-theme');
+      if (t && ['dark','mono','light'].includes(t))
+        document.documentElement.setAttribute('data-theme', t);
+    }} catch(e) {{}}
+  }})();
+</script>
+<style>
+  *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+
+  :root, [data-theme="dark"] {{
+    --bg:          #090d1a;
+    --bg-topbar:   rgba(9,13,26,.97);
+    --surface:     #0b0f22;
+    --border:      #1c2540;
+    --border-hi:   #2a3560;
+    --text:        #c0cce8;
+    --muted:       #3a4870;
+    --dim:         #1c2540;
+    --accent:      #00e5ff;
+    --accent-dim:  rgba(0,229,255,.15);
+    --accent-bdr:  rgba(0,229,255,.35);
+    --live:        #ff0066;
+    --live-bg:     rgba(255,0,102,.15);
+    --live-bdr:    rgba(255,0,102,.35);
+    --cell-bg:     #0b0f22;
+    --thumb-bg:    #040609;
+    --thumb-num:   #0e1428;
+    --foot-bg:     #0b0f22;
+  }}
+  [data-theme="mono"] {{
+    --bg:          #100e06;
+    --bg-topbar:   rgba(12,10,4,.98);
+    --surface:     #0c0a04;
+    --border:      #2a1e08;
+    --border-hi:   #3a2810;
+    --text:        #e8d0a0;
+    --muted:       #5a3818;
+    --dim:         #2a1e08;
+    --accent:      #ff6600;
+    --accent-dim:  rgba(255,102,0,.15);
+    --accent-bdr:  rgba(255,102,0,.4);
+    --live:        #ff2200;
+    --live-bg:     rgba(255,34,0,.15);
+    --live-bdr:    rgba(255,34,0,.4);
+    --cell-bg:     #0c0a04;
+    --thumb-bg:    #070604;
+    --thumb-num:   #1a1208;
+    --foot-bg:     #0c0a04;
+  }}
+  [data-theme="light"] {{
+    --bg:          #f3f5fa;
+    --bg-topbar:   rgba(26,31,56,.98);
+    --surface:     #fff;
+    --border:      #c8cedd;
+    --border-hi:   #b0b8d0;
+    --text:        #1a1f38;
+    --muted:       #6878a8;
+    --dim:         #e4e8f4;
+    --accent:      #4d9fff;
+    --accent-dim:  rgba(77,159,255,.12);
+    --accent-bdr:  rgba(77,159,255,.4);
+    --live:        #dc2626;
+    --live-bg:     rgba(220,38,38,.1);
+    --live-bdr:    rgba(220,38,38,.35);
+    --cell-bg:     #fff;
+    --thumb-bg:    #edf0f8;
+    --thumb-num:   #c0c8de;
+    --foot-bg:     #fff;
+  }}
+
+  @keyframes blink {{ 0%,100%{{opacity:1}} 50%{{opacity:.15}} }}
+  @keyframes scan  {{ 0%{{top:-100%}} 100%{{top:200%}} }}
+
+  body {{
+    background: var(--bg); color: var(--text);
+    font-family: 'Inter', sans-serif;
+    display: flex; flex-direction: column;
+    height: 100vh; overflow: hidden;
+  }}
+
+  /* ── Topbar ── */
+  .topbar {{
+    padding: 11px 18px; border-bottom: 1px solid var(--border);
+    background: var(--bg-topbar); backdrop-filter: blur(14px);
+    display: flex; align-items: center; gap: 12px; flex-shrink: 0;
+  }}
+  .logo {{ font-weight: 900; font-style: italic; font-size: 16px;
+           text-transform: uppercase; color: var(--text); text-decoration: none; }}
+  .logo span {{ color: var(--accent); }}
+  .page-title {{ font-size: 10px; font-weight: 700; text-transform: uppercase;
+                 letter-spacing: .14em; color: var(--muted); }}
+  .spacer {{ flex: 1; }}
+  .nav-link {{
+    font-size: 10px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: .08em; color: var(--muted); text-decoration: none;
+    padding: 5px 10px; border-radius: 4px; border: 1px solid var(--border);
+    transition: color .15s;
+  }}
+  .nav-link:hover {{ color: var(--text); }}
+  .nav-link.active {{ color: var(--accent); background: var(--accent-dim); border-color: var(--accent-bdr); }}
+
+  /* ── Grid ── */
+  #mv-grid {{
+    flex: 1; display: grid;
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: 1fr 1fr;
+    gap: 3px; background: var(--bg); padding: 3px;
+    min-height: 0;
+  }}
+
+  /* Layout variants */
+  #mv-grid.layout-1x1 {{ grid-template-columns: 1fr; grid-template-rows: 1fr; }}
+  #mv-grid.layout-1x1 .mv-cell:not(:first-child) {{ display: none; }}
+
+  #mv-grid.layout-1plus3 {{ grid-template-columns: 2fr 1fr; grid-template-rows: 1fr 1fr; }}
+  #mv-grid.layout-1plus3 .mv-cell:first-child {{ grid-row: 1 / 3; }}
+
+  #mv-grid.layout-2plus2 {{ grid-template-columns: 1fr 1fr; grid-template-rows: auto 1fr; }}
+
+  /* ── Cell ── */
+  .mv-cell {{
+    background: var(--cell-bg); border: 1px solid var(--border);
+    border-radius: 4px; display: flex; flex-direction: column;
+    overflow: hidden; transition: border-color .2s; min-height: 0;
+  }}
+  .mv-cell.live {{ border-color: var(--accent-bdr); }}
+
+  /* ── Video area ── */
+  .mv-thumb {{
+    flex: 1; background: var(--thumb-bg);
+    display: flex; align-items: center; justify-content: center;
+    position: relative; overflow: hidden; min-height: 0;
+  }}
+  .mv-thumb video {{
+    width: 100%; height: 100%; object-fit: contain;
+    display: none; background: #000;
+  }}
+  .mv-placeholder {{
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+  }}
+  .mv-num {{
+    font-size: 28px; font-weight: 900; font-style: italic;
+    color: var(--thumb-num); user-select: none;
+  }}
+  .mv-scan {{
+    position: absolute; left: 0; right: 0; height: 2px;
+    background: var(--accent-dim);
+    animation: scan 3s linear infinite;
+    display: none;
+  }}
+  .mv-cell.live .mv-scan {{ display: block; }}
+  .mv-nosig {{
+    position: absolute; bottom: 8px; left: 0; right: 0; text-align: center;
+    font-size: 8px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: .14em; color: var(--muted);
+  }}
+
+  /* Badges */
+  .mv-badge {{
+    position: absolute; font-size: 9px; font-weight: 900;
+    text-transform: uppercase; letter-spacing: .07em;
+    padding: 2px 7px; border-radius: 3px;
+    display: flex; align-items: center; gap: 4px;
+  }}
+  .mv-live-b {{ top: 7px; left: 7px; background: var(--live-bg); border: 1px solid var(--live-bdr); color: var(--live); }}
+  .mv-sig-b  {{ top: 7px; right: 7px; background: var(--accent-dim); border: 1px solid var(--border); color: var(--muted); font-size: 8px; }}
+  .mv-rec-b  {{ bottom: 7px; left: 7px; background: var(--live-bg); border: 1px solid var(--live-bdr); color: var(--live); }}
+  .blink-dot {{ width: 5px; height: 5px; border-radius: 50%; background: currentColor;
+                animation: blink 1.4s ease-in-out infinite; }}
+
+  /* ── Cell footer ── */
+  .mv-foot {{
+    padding: 6px 9px; border-top: 1px solid var(--border);
+    display: flex; align-items: center; gap: 7px;
+    background: var(--foot-bg); flex-shrink: 0;
+  }}
+  .mv-title {{ font-size: 11px; font-weight: 900; text-transform: uppercase;
+               letter-spacing: .03em; color: var(--text); }}
+  .mv-sub   {{ font-size: 10px; color: var(--muted); margin-top: 1px; }}
+  .mv-sel {{
+    font-size: 10px; font-weight: 700; background: var(--dim);
+    border: 1px solid var(--border); color: var(--text);
+    padding: 4px 6px; border-radius: 3px; outline: none;
+    font-family: 'Inter', sans-serif; cursor: pointer; max-width: 140px; flex-shrink: 0;
+  }}
+  .mv-sel:focus {{ border-color: var(--accent); }}
+  .mv-btn {{
+    font-size: 9px; font-weight: 900; text-transform: uppercase; letter-spacing: .07em;
+    padding: 4px 9px; border-radius: 3px; cursor: pointer;
+    font-family: 'Inter', sans-serif; flex-shrink: 0;
+    background: var(--dim); border: 1px solid var(--border); color: var(--muted);
+    transition: opacity .15s;
+  }}
+  .mv-btn:hover {{ opacity: .8; }}
+  .mv-btn.full {{ border-color: var(--accent-bdr); color: var(--accent); background: var(--accent-dim); }}
+
+  /* ── Controls bar ── */
+  .ctrl-bar {{
+    padding: 9px 18px; border-top: 1px solid var(--border);
+    background: var(--surface);
+    display: flex; align-items: center; gap: 10px; flex-shrink: 0;
+  }}
+  .ctrl-lbl {{ font-size: 9px; font-weight: 700; text-transform: uppercase;
+               letter-spacing: .12em; color: var(--muted); }}
+  .layout-btn {{
+    font-size: 9px; font-weight: 900; text-transform: uppercase; letter-spacing: .07em;
+    padding: 5px 11px; border-radius: 3px; border: 1px solid var(--border);
+    background: var(--dim); color: var(--muted); cursor: pointer;
+    font-family: 'Inter', sans-serif; transition: opacity .15s;
+  }}
+  .layout-btn:hover {{ opacity: .8; }}
+  .layout-btn.on {{ background: var(--accent-dim); border-color: var(--accent-bdr); color: var(--accent); }}
+  .ctrl-div {{ width: 1px; height: 20px; background: var(--border); margin: 0 2px; }}
+  .ctrl-btn {{
+    font-size: 9px; font-weight: 900; text-transform: uppercase; letter-spacing: .07em;
+    padding: 5px 11px; border-radius: 3px; border: 1px solid var(--border);
+    background: var(--dim); color: var(--muted); cursor: pointer;
+    font-family: 'Inter', sans-serif; transition: opacity .15s;
+  }}
+  .ctrl-btn:hover {{ opacity: .8; }}
+  .live-count {{ font-size: 9px; font-weight: 700; text-transform: uppercase;
+                 letter-spacing: .1em; color: var(--accent); }}
+  .back-lnk {{ font-size: 10px; font-weight: 700; text-transform: uppercase;
+               letter-spacing: .08em; color: var(--muted); text-decoration: none;
+               margin-left: auto; transition: color .15s; }}
+  .back-lnk:hover {{ color: var(--text); }}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.min.js"></script>
+</head>
+<body>
+
+<div class="topbar">
+  <a href="/" class="logo">Broadcast<span>Hub</span></a>
+  <span class="page-title">/ Multiview</span>
+  <div class="spacer"></div>
+  <a href="/" class="nav-link">Dashboard</a>
+  <a href="/mobile" class="nav-link">Mobile ↗</a>
+  <a href="/multiview" class="nav-link active">Multiview</a>
+  <a href="/logs" class="nav-link">Log ↗</a>
+</div>
+
+<div id="mv-grid">
+  <div class="mv-cell" id="cell-0">
+    <div class="mv-thumb" id="thumb-0">
+      <div class="mv-scan"></div>
+      <div class="mv-placeholder" id="placeholder-0"><div class="mv-num" id="num-0">—</div></div>
+      <video id="video-0" playsinline muted></video>
+      <div class="mv-badge mv-live-b" id="live-badge-0" style="display:none"><span class="blink-dot"></span> Live</div>
+      <div class="mv-badge mv-sig-b" id="sig-badge-0"></div>
+      <div class="mv-badge mv-rec-b" id="rec-badge-0" style="display:none"><span class="blink-dot"></span> <span id="rec-timer-0"></span></div>
+    </div>
+    <div class="mv-foot">
+      <div style="flex:1;min-width:0">
+        <div class="mv-title" id="title-0">—</div>
+        <div class="mv-sub" id="sub-0">Select an input</div>
+      </div>
+      <select class="mv-sel" id="sel-0" onchange="assignInput(0, this.value)">
+        <option value="">— None —</option>
+      </select>
+      <button class="mv-btn" id="play-btn-0" onclick="playCell(0)" title="Play">&#9654; Play</button>
+      <button class="mv-btn" id="stop-btn-0" onclick="stopPlayer(0)" title="Stop" style="display:none">&#9632; Stop</button>
+      <button class="mv-btn full" onclick="toggleFullscreen(0)" title="Fullscreen">⛶</button>
+    </div>
+  </div>
+
+  <div class="mv-cell" id="cell-1">
+    <div class="mv-thumb" id="thumb-1">
+      <div class="mv-scan"></div>
+      <div class="mv-placeholder" id="placeholder-1"><div class="mv-num" id="num-1">—</div></div>
+      <video id="video-1" playsinline muted></video>
+      <div class="mv-badge mv-live-b" id="live-badge-1" style="display:none"><span class="blink-dot"></span> Live</div>
+      <div class="mv-badge mv-sig-b" id="sig-badge-1"></div>
+      <div class="mv-badge mv-rec-b" id="rec-badge-1" style="display:none"><span class="blink-dot"></span> <span id="rec-timer-1"></span></div>
+    </div>
+    <div class="mv-foot">
+      <div style="flex:1;min-width:0">
+        <div class="mv-title" id="title-1">—</div>
+        <div class="mv-sub" id="sub-1">Select an input</div>
+      </div>
+      <select class="mv-sel" id="sel-1" onchange="assignInput(1, this.value)">
+        <option value="">— None —</option>
+      </select>
+      <button class="mv-btn" id="play-btn-1" onclick="playCell(1)" title="Play">&#9654; Play</button>
+      <button class="mv-btn" id="stop-btn-1" onclick="stopPlayer(1)" title="Stop" style="display:none">&#9632; Stop</button>
+      <button class="mv-btn full" onclick="toggleFullscreen(1)" title="Fullscreen">⛶</button>
+    </div>
+  </div>
+
+  <div class="mv-cell" id="cell-2">
+    <div class="mv-thumb" id="thumb-2">
+      <div class="mv-scan"></div>
+      <div class="mv-placeholder" id="placeholder-2"><div class="mv-num" id="num-2">—</div></div>
+      <video id="video-2" playsinline muted></video>
+      <div class="mv-badge mv-live-b" id="live-badge-2" style="display:none"><span class="blink-dot"></span> Live</div>
+      <div class="mv-badge mv-sig-b" id="sig-badge-2"></div>
+      <div class="mv-badge mv-rec-b" id="rec-badge-2" style="display:none"><span class="blink-dot"></span> <span id="rec-timer-2"></span></div>
+    </div>
+    <div class="mv-foot">
+      <div style="flex:1;min-width:0">
+        <div class="mv-title" id="title-2">—</div>
+        <div class="mv-sub" id="sub-2">Select an input</div>
+      </div>
+      <select class="mv-sel" id="sel-2" onchange="assignInput(2, this.value)">
+        <option value="">— None —</option>
+      </select>
+      <button class="mv-btn" id="play-btn-2" onclick="playCell(2)" title="Play">&#9654; Play</button>
+      <button class="mv-btn" id="stop-btn-2" onclick="stopPlayer(2)" title="Stop" style="display:none">&#9632; Stop</button>
+      <button class="mv-btn full" onclick="toggleFullscreen(2)" title="Fullscreen">⛶</button>
+    </div>
+  </div>
+
+  <div class="mv-cell" id="cell-3">
+    <div class="mv-thumb" id="thumb-3">
+      <div class="mv-scan"></div>
+      <div class="mv-placeholder" id="placeholder-3"><div class="mv-num" id="num-3">—</div></div>
+      <video id="video-3" playsinline muted></video>
+      <div class="mv-badge mv-live-b" id="live-badge-3" style="display:none"><span class="blink-dot"></span> Live</div>
+      <div class="mv-badge mv-sig-b" id="sig-badge-3"></div>
+      <div class="mv-badge mv-rec-b" id="rec-badge-3" style="display:none"><span class="blink-dot"></span> <span id="rec-timer-3"></span></div>
+    </div>
+    <div class="mv-foot">
+      <div style="flex:1;min-width:0">
+        <div class="mv-title" id="title-3">—</div>
+        <div class="mv-sub" id="sub-3">Select an input</div>
+      </div>
+      <select class="mv-sel" id="sel-3" onchange="assignInput(3, this.value)">
+        <option value="">— None —</option>
+      </select>
+      <button class="mv-btn" id="play-btn-3" onclick="playCell(3)" title="Play">&#9654; Play</button>
+      <button class="mv-btn" id="stop-btn-3" onclick="stopPlayer(3)" title="Stop" style="display:none">&#9632; Stop</button>
+      <button class="mv-btn full" onclick="toggleFullscreen(3)" title="Fullscreen">⛶</button>
+    </div>
+  </div>
+</div>
+
+<div class="ctrl-bar">
+  <span class="ctrl-lbl">Layout</span>
+  <button class="layout-btn on" id="lb-2x2"     onclick="setLayout('2x2')">2 × 2</button>
+  <button class="layout-btn"   id="lb-1plus3"   onclick="setLayout('1plus3')">1 + 3</button>
+  <button class="layout-btn"   id="lb-1x1"      onclick="setLayout('1x1')">1 × 1</button>
+  <div class="ctrl-div"></div>
+  <button class="ctrl-btn" onclick="muteAll(true)">Mute All</button>
+  <button class="ctrl-btn" onclick="muteAll(false)">Unmute All</button>
+  <div class="ctrl-div"></div>
+  <span class="live-count" id="live-count">0 live</span>
+  <a class="back-lnk" href="/">← Dashboard</a>
+</div>
+
+<script>
+  const ALL_IDS   = {ids_js};
+  const LIVE_IDS  = {live_js};
+  const LABELS    = {label_js};
+  const META      = {meta_js};
+
+  // ── State ────────────────────────────────────────────────────────────────
+  const assignments = [null, null, null, null];  // input_id per quadrant
+  const players     = [null, null, null, null];  // mpegts player per quadrant
+  let   recTimers   = {{}};                        // input_id -> started_at (from SSE)
+  let   liveSet     = new Set(LIVE_IDS);
+  let   recSet      = {{}};                        // input_id -> elapsed seconds
+
+  // ── Build dropdowns ──────────────────────────────────────────────────────
+  function buildSelects() {{
+    for (let q = 0; q < 4; q++) {{
+      const sel = document.getElementById('sel-' + q);
+      sel.innerHTML = '<option value="">— None —</option>';
+      for (const id of ALL_IDS) {{
+        const opt = document.createElement('option');
+        opt.value = id;
+        opt.textContent = LABELS[id] || id;
+        sel.appendChild(opt);
+      }}
+    }}
+    // Auto-assign first inputs on first load if nothing saved
+    const saved = loadSaved();
+    if (saved) {{
+      saved.forEach((id, q) => {{ if (id) assignInput(q, id, true); }});
+    }} else {{
+      ALL_IDS.slice(0, 4).forEach((id, q) => assignInput(q, id, true));
+    }}
+  }}
+
+  // ── Persistence ──────────────────────────────────────────────────────────
+  function saveSaved() {{
+    try {{ localStorage.setItem('bh-mv', JSON.stringify(assignments)); }} catch(e) {{}}
+  }}
+  function loadSaved() {{
+    try {{
+      const v = localStorage.getItem('bh-mv');
+      return v ? JSON.parse(v) : null;
+    }} catch(e) {{ return null; }}
+  }}
+
+  // ── Assign input to quadrant ─────────────────────────────────────────────
+  function assignInput(q, inputId, skipSave) {{
+    stopPlayer(q);
+    assignments[q] = inputId || null;
+    document.getElementById('sel-' + q).value = inputId || '';
+    if (!skipSave) saveSaved();
+    updateCell(q);
+    // Don't auto-start — user presses Play per cell
+  }}
+
+  // ── Update cell UI ────────────────────────────────────────────────────────
+  function updateCell(q) {{
+    const id    = assignments[q];
+    const cell  = document.getElementById('cell-' + q);
+    const isLive = id && liveSet.has(id);
+    const m      = id ? (META[id] || {{}}) : {{}};
+
+    document.getElementById('num-' + q).textContent   = id || '—';
+    document.getElementById('title-' + q).textContent = id ? (LABELS[id] || id) : '—';
+
+    const sub = document.getElementById('sub-' + q);
+    if (!id)       sub.textContent = 'Select an input';
+    else if (!isLive) sub.textContent = 'Offline — waiting for signal';
+    else           sub.textContent = (m.encoder || '') + (m.desc ? ' · ' + m.desc : '') + ' · ready';
+
+    cell.classList.toggle('live', !!isLive);
+
+    // Live badge
+    const lb = document.getElementById('live-badge-' + q);
+    lb.style.display = isLive ? 'flex' : 'none';
+
+    // Signal badge
+    const sb = document.getElementById('sig-badge-' + q);
+    sb.textContent = (id && m.desc) ? m.desc : '';
+
+    // Recording badge
+    const rb = document.getElementById('rec-badge-' + q);
+    const isRec = id && recSet[id] !== undefined;
+    rb.style.display = isRec ? 'flex' : 'none';
+
+    // Placeholder visibility
+    const vid = document.getElementById('video-' + q);
+    const ph  = document.getElementById('placeholder-' + q);
+    if (vid.style.display === 'block') {{ ph.style.display = 'none'; }}
+    else {{ ph.style.display = ''; }}
+  }}
+
+  // ── Play / Stop per cell ─────────────────────────────────────────────────
+  function playCell(q) {{
+    const id = assignments[q];
+    if (!id) return;
+    const vid = document.getElementById('video-' + q);
+    const ph  = document.getElementById('placeholder-' + q);
+    if (players[q]) {{ players[q].destroy(); players[q] = null; }}
+    const p = mpegts.createPlayer({{ type: 'mpegts', isLive: true, url: '/multiview-feed/' + id }});
+    p.attachMediaElement(vid);
+    p.load();
+    vid.play().catch(() => {{}});
+    vid.style.display = 'block';
+    ph.style.display  = 'none';
+    players[q] = p;
+    _setPlayBtns(q, true);
+  }}
+
+  function _setPlayBtns(q, playing) {{
+    const pb = document.getElementById('play-btn-' + q);
+    const sb = document.getElementById('stop-btn-' + q);
+    if (pb) pb.style.display = playing ? 'none' : '';
+    if (sb) sb.style.display = playing ? ''     : 'none';
+  }}
+
+  function stopPlayer(q) {{
+    if (players[q]) {{ players[q].destroy(); players[q] = null; }}
+    const vid = document.getElementById('video-' + q);
+    const ph  = document.getElementById('placeholder-' + q);
+    if (vid) {{ vid.pause(); vid.src = ''; vid.style.display = 'none'; }}
+    if (ph)  ph.style.display = '';
+    _setPlayBtns(q, false);
+  }}
+
+  // ── Mute all / unmute all ────────────────────────────────────────────────
+  function muteAll(muted) {{
+    for (let q = 0; q < 4; q++) {{
+      const v = document.getElementById('video-' + q);
+      if (v) v.muted = muted;
+    }}
+  }}
+
+  // ── Layout ───────────────────────────────────────────────────────────────
+  let currentLayout = '2x2';
+  function setLayout(layout) {{
+    currentLayout = layout;
+    const grid = document.getElementById('mv-grid');
+    grid.className = 'layout-' + layout;
+    document.querySelectorAll('.layout-btn').forEach(b => b.classList.remove('on'));
+    document.getElementById('lb-' + layout.replace('+','plus'))?.classList.add('on');
+    try {{ localStorage.setItem('bh-mv-layout', layout); }} catch(e) {{}}
+  }}
+
+  // ── Fullscreen (expand cell 0 in 1x1 mode) ───────────────────────────────
+  function toggleFullscreen(q) {{
+    if (currentLayout === '1x1' && assignments[0] === assignments[q]) {{
+      setLayout('2x2'); return;
+    }}
+    // Swap clicked quadrant to position 0 then go 1x1
+    const id = assignments[q];
+    assignInput(q, assignments[0], true);
+    assignInput(0, id, true);
+    saveSaved();
+    setLayout('1x1');
+  }}
+
+  // ── SSE stats — live status + recording timers ────────────────────────────
+  let recIntervalId = null;
+
+  function fmtElapsed(s) {{
+    const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
+    return [h,m,sec].map(v=>String(v).padStart(2,'0')).join(':');
+  }}
+
+  function tickRecTimers() {{
+    for (let q = 0; q < 4; q++) {{
+      const id = assignments[q];
+      if (id && recSet[id] !== undefined) {{
+        recSet[id]++;
+        const el = document.getElementById('rec-timer-' + q);
+        if (el) el.textContent = fmtElapsed(recSet[id]);
+      }}
+    }}
+  }}
+
+  (function connectSSE() {{
+    const es = new EventSource('/api/stats');
+    es.onmessage = e => {{
+      try {{
+        const d = JSON.parse(e.data);
+        const newLive = new Set(d.input_ids?.filter(id => d.inputs?.[id]) || []);
+
+        // Detect live changes — only stop players, never block starts
+        for (let q = 0; q < 4; q++) {{
+          const id = assignments[q];
+          if (!id) continue;
+          const wasLive = liveSet.has(id);
+          const isLive  = newLive.has(id);
+          // Only stop if input went away AND player is running
+          if (wasLive && !isLive && players[q]) stopPlayer(q);
+        }}
+        liveSet = newLive;
+
+        // Recording timers
+        const newRec = {{}};
+        for (const r of (d.recordings || [])) newRec[r.input_id] = r.elapsed;
+        recSet = newRec;
+
+        // Update live count
+        const liveCount = [...new Set(assignments.filter(id => id && liveSet.has(id)))].length;
+        document.getElementById('live-count').textContent = liveCount + ' live';
+
+        // Refresh all cells
+        for (let q = 0; q < 4; q++) updateCell(q);
+
+      }} catch(err) {{ console.warn('SSE', err); }}
+    }};
+    es.onerror = () => {{ es.close(); setTimeout(connectSSE, 3000); }};
+  }})();
+
+  // ── Init ─────────────────────────────────────────────────────────────────
+  document.addEventListener('DOMContentLoaded', () => {{
+    // Restore layout
+    try {{
+      const l = localStorage.getItem('bh-mv-layout');
+      if (l) setLayout(l);
+    }} catch(e) {{}}
+
+    buildSelects();
+
+    // Tick recording timers every second
+    recIntervalId = setInterval(tickRecTimers, 1000);
+  }});
+</script>
+</body>
+</html>"""
+
+
+# ---------------------------------------------------------------------------
 # render_dashboard
 # ---------------------------------------------------------------------------
 # Parameters:
@@ -355,11 +1006,6 @@ def render_dashboard(
             '<div class="thumb-badge hls-badge-th"><span class="blink-dot hls-dot-col"></span> HLS</div>'
             if is_hls else ""
         )
-        driver_badge = (
-            '<div class="thumb-badge driver-badge-dl">DL</div>'
-            if driver == "decklink" else
-            '<div class="thumb-badge driver-badge-mw">MW</div>'
-        )
         no_sig = "" if is_live else '<div class="no-sig">No Signal</div>'
 
         # Status subtitle
@@ -424,82 +1070,27 @@ def render_dashboard(
               </select>
             </div>"""
 
-        # Decklink config panel (collapsed by default)
-        if driver == "decklink":
-            dl_cfg       = cfg.get(i, {})
-            saved_acodec = dl_cfg.get("audio_codec",    "aac")
-            saved_layout = dl_cfg.get("channel_layout", "stereo")
-            saved_lfe    = dl_cfg.get("fix_lfe_swap",   False)
-            # Show LFE fix only for surround layouts
-            lfe_display  = "" if saved_layout in ("5.1", "7.1", "8ch") else "display:none"
 
-            dl_panel = f"""<div class="dl-panel" id="dlpanel-{i}">
-              <div class="dl-panel-hdr" onclick="toggleDlPanel('{i}')">
-                &#9881; Decklink Config <span class="vchip-caret" id="dlcaret-{i}">&#9660;</span>
-              </div>
-              <div class="dl-panel-body" id="dlbody-{i}" style="display:none">
-
-                <div class="dl-section-lbl">Video</div>
-                <div class="dl-fmt-row">
-                  <label class="dl-lbl">Format</label>
-                  <select class="dl-input dl-fmt-select" id="dl-fmt-{i}">
-                    <option value="{dl_cfg.get('format_code','hp50')}">{dl_cfg.get('format_code','hp50')} (saved)</option>
-                  </select>
-                  <button class="dl-refresh-btn" id="dl-fmtbtn-{i}" onclick="loadDlFormats('{i}')" title="Query device for available formats">&#8635;</button>
-                </div>
-                <div class="dl-fmt-status" id="dl-fmtstatus-{i}"></div>
-                <div class="dl-grid">
-                  <label class="dl-lbl">Mode</label>
-                  <select class="dl-input" id="dl-qmode-{i}" onchange="dlToggleMode('{i}')">
-                    <option value="cqp"{"  selected" if dl_cfg.get('quality_mode','cqp')=='cqp' else ''}>CQP (Q value)</option>
-                    <option value="cbr"{"  selected" if dl_cfg.get('quality_mode','cqp')=='cbr' else ''}>CBR (bitrate)</option>
-                  </select>
-                  <label class="dl-lbl" id="dl-vblbl-{i}">Video BR</label>
-                  <input class="dl-input" id="dl-vbr-{i}" type="text" value="{dl_cfg.get('video_bitrate','50M')}" placeholder="50M">
-                  <label class="dl-lbl">VFilter</label>
-                  <input class="dl-input" id="dl-vf-{i}" type="text" value="{dl_cfg.get('video_filter','yadif=1,scale=1920:1080')}" placeholder="yadif=1,scale=1920:1080">
-                  <label class="dl-lbl">GOP</label>
-                  <input class="dl-input" id="dl-gop-{i}" type="number" value="{dl_cfg.get('gop',90)}" placeholder="90">
-                </div>
-
-                <div class="dl-section-lbl" style="margin-top:10px">Audio</div>
-                <div class="dl-grid">
-                  <label class="dl-lbl">Codec</label>
-                  <select class="dl-input" id="dl-acodec-{i}" onchange="dlUpdateAudioOptions('{i}')">
-                    {_audio_codec_options(saved_acodec)}
-                  </select>
-                  <label class="dl-lbl">Layout</label>
-                  <select class="dl-input" id="dl-layout-{i}" onchange="dlUpdateAudioOptions('{i}')">
-                    {_ch_layout_options(saved_layout)}
-                  </select>
-                  <label class="dl-lbl">Audio BR</label>
-                  <input class="dl-input" id="dl-abr-{i}" type="text" value="{dl_cfg.get('audio_bitrate','128k')}" placeholder="128k">
-                </div>
-                <label class="dl-lfe-row" id="dl-lfe-row-{i}" style="{lfe_display}">
-                  <input type="checkbox" id="dl-lfe-{i}" {"checked" if saved_lfe else ""}>
-                  <span>Fix BMD LFE/Center channel swap <span class="dl-lfe-hint">(Intensity cards only)</span></span>
-                </label>
-                <div class="dl-audio-warn" id="dl-audio-warn-{i}" style="display:none"></div>
-
-                <button class="btn q-btn" style="margin-top:10px;width:100%" onclick="submitDlCfg('{i}')">Apply &amp; Restart</button>
-              </div>
-            </div>"""
-        else:
-            dl_panel = ""
-
-        # ── Magewell advanced config panel ──────────────────────────────────
         if driver == "magewell":
-            mw_cfg      = cfg.get(i, {})
-            saved_preset = mw_cfg.get("preset",       "")
-            saved_la     = mw_cfg.get("lookahead",    35)
-            saved_p010   = mw_cfg.get("p010",         False)
-            saved_noa    = mw_cfg.get("no_audio",     False)
-            saved_dev    = mw_cfg.get("vaapi_device", "")
+            mw_cfg           = cfg.get(i, {})
+            saved_preset     = mw_cfg.get("preset",          "")
+            saved_la         = mw_cfg.get("lookahead",        35)
+            saved_gop        = mw_cfg.get("gop_secs",         1.5)
+            saved_gpu        = mw_cfg.get("gpu_buffers",      16)
+            saved_vbuf       = mw_cfg.get("video_buffers",    16)
+            saved_ehf        = mw_cfg.get("extra_hw_frames",  32)
+            saved_p010       = mw_cfg.get("p010",             False)
+            saved_noa        = mw_cfg.get("no_audio",         False)
+            saved_dev        = mw_cfg.get("vaapi_device",     "")
+            saved_edid          = mw_cfg.get("edid_path",    "")
+            saved_edid_refresh  = mw_cfg.get("edid_refresh", False)
             mw_panel = f"""<div class="dl-panel" id="mwpanel-{i}">
               <div class="dl-panel-hdr" onclick="toggleMwPanel('{i}')">
                 &#9881; Magewell Config <span class="vchip-caret" id="mwcaret-{i}">&#9660;</span>
               </div>
               <div class="dl-panel-body" id="mwbody-{i}" style="display:none">
+
+                <div class="dl-section-lbl">Encoder</div>
                 <div class="dl-grid">
                   <label class="dl-lbl">Preset</label>
                   <select class="dl-input" id="mw-preset-{i}">
@@ -512,11 +1103,33 @@ def render_dashboard(
                       oninput="document.getElementById('mw-la-val-{i}').textContent=this.value">
                     <span class="mw-la-val" id="mw-la-val-{i}">{saved_la}</span>
                   </div>
+                  <label class="dl-lbl" title="GOP size in seconds. 0 to disable.">GOP secs</label>
+                  <input class="dl-input" id="mw-gop-{i}" type="number"
+                    min="0" max="10" step="0.5" value="{saved_gop}" placeholder="1.5">
                   <label class="dl-lbl">Device</label>
                   <input class="dl-input" id="mw-dev-{i}" type="text"
                     value="{saved_dev}" placeholder="renderD128">
                 </div>
-                <label class="dl-lfe-row" style="margin-top:8px">
+
+                <div class="dl-section-lbl" style="margin-top:10px">Buffer Tuning</div>
+                <div class="dl-grid">
+                  <label class="dl-lbl" title="--gpu-buffers: VRAM queue depth (min 16)">GPU Bufs</label>
+                  <input class="dl-input" id="mw-gpu-{i}" type="number"
+                    min="16" max="256" value="{saved_gpu}" placeholder="16">
+                  <label class="dl-lbl" title="--video-buffers: RAM queue depth">RAM Bufs</label>
+                  <input class="dl-input" id="mw-vbuf-{i}" type="number"
+                    min="1" max="256" value="{saved_vbuf}" placeholder="16">
+                  <label class="dl-lbl" title="--extra-hw-frames: extra HW frames (min 32)">HW Extra</label>
+                  <input class="dl-input" id="mw-ehf-{i}" type="number"
+                    min="32" max="256" value="{saved_ehf}" placeholder="32">
+                </div>
+                <div class="dl-lfe-hint" style="margin-top:5px;font-size:10px">
+                  GPU load ≈ GPU&nbsp;Bufs&nbsp;+&nbsp;HW&nbsp;Extra&nbsp;+&nbsp;Lookahead&nbsp;+&nbsp;16.
+                  If encoder fails with "Invalid argument", reduce Lookahead first.
+                </div>
+
+                <div class="dl-section-lbl" style="margin-top:10px">Options</div>
+                <label class="dl-lfe-row">
                   <input type="checkbox" id="mw-p010-{i}" {"checked" if saved_p010 else ""}>
                   <span>p010 — 10-bit encoding <span class="dl-lfe-hint">(better quality, HDR sources)</span></span>
                 </label>
@@ -526,15 +1139,46 @@ def render_dashboard(
                 </label>
                 <button class="btn q-btn" style="margin-top:10px;width:100%"
                   onclick="submitMwCfg('{i}')">Apply &amp; Restart</button>
+
+                <div class="dl-section-lbl" style="margin-top:14px">EDID</div>
+                <div class="mw-edid-status" id="mw-edid-status-{i}"></div>
+                <div class="dl-fmt-row" style="margin-top:5px">
+                  <select class="dl-input dl-fmt-select" id="mw-edid-sel-{i}"
+                    onchange="mwEdidSelChange('{i}')">
+                    <option value="">— select a .bin file —</option>
+                  </select>
+                  <button class="dl-refresh-btn" id="mw-edid-refresh-{i}"
+                    onclick="mwLoadEdidList('{i}')" title="Scan for EDID files">&#8635;</button>
+                </div>
+                <input class="dl-input" id="mw-edid-path-{i}" type="text"
+                  value="{saved_edid}" placeholder="or paste full path to .bin"
+                  style="margin-top:5px">
+                <div class="dl-lfe-hint" style="margin-top:4px;font-size:10px;color:var(--muted)">
+                  Saved EDID is written automatically each time the input starts.
+                  EDID does not survive a reboot without this.
+                </div>
+                <label class="dl-lfe-row" style="margin-top:6px">
+                  <input type="checkbox" id="mw-edid-refresh-chk-{i}"
+                    {"checked" if saved_edid_refresh else ""}>
+                  <span>Periodic EDID refresh
+                    <span class="dl-lfe-hint">(every 25s when idle — enable for Eco cards)</span>
+                  </span>
+                </label>
+                <div style="display:flex;gap:6px;margin-top:8px">
+                  <button class="btn q-btn" style="flex:1" onclick="mwReadEdid('{i}')">
+                    &#128065; Read Current
+                  </button>
+                  <button class="btn q-btn" style="flex:1;background:var(--accent-dim);border-color:var(--accent-bdr)"
+                    onclick="mwWriteEdid('{i}')">
+                    &#128229; Write EDID
+                  </button>
+                </div>
+                <div class="mw-edid-console" id="mw-edid-console-{i}" style="display:none"></div>
               </div>
             </div>"""
-        else:
-            mw_panel = ""
 
-        # Q control — hide for decklink CBR mode
+        # Q control is always visible (Decklink CBR mode removed)
         q_row_style = ""
-        if driver == "decklink" and cfg.get(i, {}).get("quality_mode") == "cbr":
-            q_row_style = " style='display:none'"
 
         # Action buttons
         hls_btn = (
@@ -554,7 +1198,6 @@ def render_dashboard(
         {no_sig}
         {live_badge}
         {hls_badge}
-        {driver_badge}
       </div>
       <div class="card-info">
         <div class="card-title">{card_label} {sig_html}</div>
@@ -570,7 +1213,6 @@ def render_dashboard(
           </div>
           {encoder_select_html}
         </div>
-        {dl_panel}
         {mw_panel}
       </div>
       <div class="btn-row" id="ctrl-{i}">
@@ -674,6 +1316,9 @@ def render_dashboard(
             "signal":       cfg.get(i, {}).get("signal", "UNKNOWN"),
             "desc":         cfg.get(i, {}).get("desc", ""),
             "adb_ip":       cfg.get(i, {}).get("adb_ip", ""),
+            "remote_type":  cfg.get(i, {}).get("remote_type", "adb" if cfg.get(i, {}).get("adb_ip") else "none"),
+            "remote_ip":    cfg.get(i, {}).get("remote_ip",   cfg.get(i, {}).get("adb_ip", "")),
+            "adb_home":     cfg.get(i, {}).get("adb_home",    False),
             "driver":       cfg.get(i, {}).get("driver", "magewell"),
             "encoder":      cfg.get(i, {}).get("encoder", _encoders[0]["value"] if _encoders else "h264_qsv"),
             "quality_mode": cfg.get(i, {}).get("quality_mode", "cqp"),
@@ -682,10 +1327,6 @@ def render_dashboard(
     }
     meta_js = json.dumps(meta_js_dict)
     encoders_js = json.dumps(_encoders)
-
-    # IDs of Decklink inputs — used to fire format queries at page load
-    decklink_ids = [i for i in current_input_ids if cfg.get(i, {}).get("driver") == "decklink"]
-    decklink_ids_js = json.dumps(decklink_ids)
 
     return f"""<!DOCTYPE html>
 <html data-theme="dark">
@@ -698,70 +1339,79 @@ def render_dashboard(
 <style>
   *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
 
-  /* ── Theme: dark (default) ── */
+  /* ── Theme: Neon Ops (default dark) ── */
   :root, [data-theme="dark"] {{
-    --bg:           #080808;
-    --bg-topbar:    rgba(8,8,8,.96);
-    --surface:      #0f0f0f;
-    --border:       #1e1e1e;
-    --border-hi:    #2a2a2a;
-    --text:         #f0f0f0;
-    --muted:        #444;
-    --dim:          #2a2a2a;
-    --accent:       #e8ff47;
-    --accent-dim:   rgba(232,255,71,.1);
-    --accent-bdr:   rgba(232,255,71,.25);
-    --live:         #ff3b3b;
-    --live-bg:      rgba(255,59,59,.12);
-    --live-bdr:     rgba(255,59,59,.3);
-    --blue:         #4a9eff;
-    --orange:       #ff8c00;
-    --purple:       #b464ff;
-    --green:        #64dc50;
+    --bg:           #090d1a;
+    --bg-topbar:    rgba(9,13,26,.97);
+    --surface:      #0b0f22;
+    --border:       #1c2540;
+    --border-hi:    #2a3560;
+    --text:         #c0cce8;
+    --muted:        #3a4870;
+    --dim:          #1c2540;
+    --accent:       #00e5ff;
+    --accent-dim:   rgba(0,229,255,.18);
+    --accent-bdr:   rgba(0,229,255,.4);
+    --live:         #ff0066;
+    --live-bg:      rgba(255,0,102,.18);
+    --live-bdr:     rgba(255,0,102,.45);
+    --blue:         #0070ff;
+    --orange:       #ff8800;
+    --purple:       #aa00ff;
+    --green:        #00e5a0;
+    --btn-preview-bg: rgba(0,229,160,.15);
+    --btn-vlc-bg:     rgba(255,136,0,.15);
+    --btn-rec-bg:     rgba(170,0,255,.15);
   }}
 
-  /* ── Theme: mono (black & white) ── */
+  /* ── Theme: Broadcast Orange (warm dark) ── */
   [data-theme="mono"] {{
-    --bg:           #000;
-    --bg-topbar:    rgba(0,0,0,.97);
-    --surface:      #0a0a0a;
-    --border:       #222;
-    --border-hi:    #333;
-    --text:         #fff;
-    --muted:        #555;
-    --dim:          #333;
-    --accent:       #fff;
-    --accent-dim:   rgba(255,255,255,.07);
-    --accent-bdr:   rgba(255,255,255,.2);
-    --live:         #fff;
-    --live-bg:      rgba(255,255,255,.07);
-    --live-bdr:     rgba(255,255,255,.25);
-    --blue:         #aaa;
-    --orange:       #ccc;
-    --purple:       #bbb;
-    --green:        #ddd;
+    --bg:           #100e06;
+    --bg-topbar:    rgba(12,10,4,.98);
+    --surface:      #0c0a04;
+    --border:       #2a1e08;
+    --border-hi:    #3a2810;
+    --text:         #e8d0a0;
+    --muted:        #5a3818;
+    --dim:          #2a1e08;
+    --accent:       #ff6600;
+    --accent-dim:   rgba(255,102,0,.18);
+    --accent-bdr:   rgba(255,102,0,.45);
+    --live:         #ff2200;
+    --live-bg:      rgba(255,34,0,.18);
+    --live-bdr:     rgba(255,34,0,.45);
+    --blue:         #ffaa00;
+    --orange:       #ff6600;
+    --purple:       #ff3388;
+    --green:        #88cc00;
+    --btn-preview-bg: rgba(136,204,0,.15);
+    --btn-vlc-bg:     rgba(255,102,0,.15);
+    --btn-rec-bg:     rgba(255,51,136,.15);
   }}
 
-  /* ── Theme: light ── */
+  /* ── Theme: Studio Pro (light) ── */
   [data-theme="light"] {{
-    --bg:           #f2f2f0;
-    --bg-topbar:    rgba(242,242,240,.97);
-    --surface:      #fff;
-    --border:       #e4e4e2;
-    --border-hi:    #d0d0ce;
-    --text:         #111;
-    --muted:        #999;
-    --dim:          #ccc;
-    --accent:       #111;
-    --accent-dim:   rgba(0,0,0,.05);
-    --accent-bdr:   rgba(0,0,0,.15);
-    --live:         #c00;
-    --live-bg:      rgba(180,0,0,.07);
-    --live-bdr:     rgba(180,0,0,.25);
-    --blue:         #2563eb;
+    --bg:           #f3f5fa;
+    --bg-topbar:    rgba(26,31,56,.98);
+    --surface:      #ffffff;
+    --border:       #c8cedd;
+    --border-hi:    #b0b8d0;
+    --text:         #1a1f38;
+    --muted:        #6878a8;
+    --dim:          #e4e8f4;
+    --accent:       #4d9fff;
+    --accent-dim:   rgba(77,159,255,.15);
+    --accent-bdr:   rgba(77,159,255,.45);
+    --live:         #dc2626;
+    --live-bg:      rgba(220,38,38,.12);
+    --live-bdr:     rgba(220,38,38,.4);
+    --blue:         #4d9fff;
     --orange:       #d97706;
     --purple:       #7c3aed;
-    --green:        #16a34a;
+    --green:        #059669;
+    --btn-preview-bg: rgba(5,150,105,.12);
+    --btn-vlc-bg:     rgba(217,119,6,.12);
+    --btn-rec-bg:     rgba(124,58,237,.12);
   }}
 
   body {{
@@ -957,29 +1607,29 @@ def render_dashboard(
     display: inline-flex; align-items: center; justify-content: center;
   }}
   .btn:active {{ opacity: .7; }}
-  .btn-preview     {{ background: rgba(100,220,80,.08); border: 1px solid rgba(100,220,80,.2) !important; color: var(--green); }}
-  .btn-preview:hover {{ background: rgba(100,220,80,.16); }}
-  .btn-vlc         {{ background: rgba(255,140,0,.08); border: 1px solid rgba(255,140,0,.2) !important; color: var(--orange); }}
-  .btn-vlc:hover   {{ background: rgba(255,140,0,.16); }}
+  .btn-preview     {{ background: var(--btn-preview-bg, rgba(100,220,80,.15)); border: 1px solid var(--green) !important; color: var(--green); }}
+  .btn-preview:hover {{ opacity: .82; }}
+  .btn-vlc         {{ background: var(--btn-vlc-bg, rgba(255,140,0,.15)); border: 1px solid var(--orange) !important; color: var(--orange); }}
+  .btn-vlc:hover   {{ opacity: .82; }}
   .btn-hls         {{ background: var(--accent-dim); border: 1px solid var(--accent-bdr) !important; color: var(--accent); }}
-  .btn-hls:hover   {{ background: rgba(232,255,71,.2); }}
-  .btn-hls-stop    {{ background: rgba(232,255,71,.03); border: 1px solid #2a2a2a !important; color: #555; }}
-  .btn-hls-stop:hover {{ color: #888; border-color: #444 !important; }}
-  .btn-record-open {{ background: rgba(180,100,255,.08); border: 1px solid rgba(180,100,255,.2) !important; color: var(--purple); }}
-  .btn-record-open:hover {{ background: rgba(180,100,255,.16); }}
-  .btn-mobile-link {{ background: rgba(232,255,71,.04); border: 1px solid rgba(232,255,71,.15) !important; color: #666; font-size: 10px; padding: 6px 10px; }}
-  .btn-stop-rec    {{ background: rgba(255,59,59,.08); border: 1px solid rgba(255,59,59,.2) !important; color: var(--live); }}
-  .btn-stop-rec:hover {{ background: rgba(255,59,59,.16); }}
-  .btn-schedule-open {{ background: rgba(232,255,71,.06); border: 1px solid rgba(232,255,71,.2) !important; color: var(--accent); }}
-  .btn-schedule-open:hover {{ background: rgba(232,255,71,.14); }}
+  .btn-hls:hover   {{ opacity: .82; }}
+  .btn-hls-stop    {{ background: var(--dim); border: 1px solid var(--border-hi) !important; color: var(--muted); }}
+  .btn-hls-stop:hover {{ opacity: .82; }}
+  .btn-record-open {{ background: var(--btn-rec-bg, rgba(180,100,255,.15)); border: 1px solid var(--purple) !important; color: var(--purple); }}
+  .btn-record-open:hover {{ opacity: .82; }}
+  .btn-mobile-link {{ background: var(--accent-dim); border: 1px solid var(--accent-bdr) !important; color: var(--muted); font-size: 10px; padding: 6px 10px; }}
+  .btn-stop-rec    {{ background: var(--live-bg); border: 1px solid var(--live-bdr) !important; color: var(--live); }}
+  .btn-stop-rec:hover {{ opacity: .82; }}
+  .btn-schedule-open {{ background: var(--accent-dim); border: 1px solid var(--accent-bdr) !important; color: var(--accent); }}
+  .btn-schedule-open:hover {{ opacity: .82; }}
   .btn-manage {{
     font-family: 'Inter', sans-serif; font-weight: 900; font-size: 10px;
     text-transform: uppercase; letter-spacing: .1em;
-    background: rgba(100,200,100,.06); border: 1px solid rgba(100,200,100,.2);
-    color: rgba(100,200,100,.7); padding: 7px 13px; border-radius: 4px;
-    cursor: pointer; transition: background .15s, color .15s;
+    background: var(--accent-dim); border: 1px solid var(--accent-bdr);
+    color: var(--accent); padding: 7px 13px; border-radius: 4px;
+    cursor: pointer; transition: opacity .15s;
   }}
-  .btn-manage:hover {{ background: rgba(100,200,100,.14); color: #6fda6f; }}
+  .btn-manage:hover {{ opacity: .82; }}
 
   /* ── HLS nodes list ── */
   .hls-list {{ display: flex; flex-direction: column; gap: 8px; }}
@@ -1012,6 +1662,44 @@ def render_dashboard(
   }}
   .gateway-url {{ font-family: 'Courier New', monospace; font-size: 13px; color: var(--accent); flex: 1; }}
   .gateway-sub {{ font-size: 11px; color: var(--muted); margin-top: 2px; }}
+
+  /* Telemetry panel */
+  .telemetry-card {{
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 4px; padding: 12px 16px;
+  }}
+  .telemetry-grid {{
+    display: flex; flex-wrap: wrap; gap: 10px;
+  }}
+  .telemetry-tile {{
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 4px; padding: 8px 12px;
+    min-width: 90px; flex: 1;
+  }}
+  .telemetry-label {{
+    font-size: 9px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: .08em; color: var(--muted); margin-bottom: 4px;
+  }}
+  .telemetry-value {{
+    font-size: 18px; font-family: 'Courier New', monospace;
+    font-weight: 700; line-height: 1;
+  }}
+  .telemetry-sub {{
+    font-size: 10px; color: var(--muted); margin-top: 3px;
+  }}
+  .telemetry-bar-track {{
+    height: 4px; background: var(--border); border-radius: 2px;
+    margin-top: 6px; overflow: hidden;
+  }}
+  .telemetry-bar-fill {{
+    height: 100%; border-radius: 2px;
+    transition: width .5s ease, background-color .5s ease;
+  }}
+  .temp-cool  {{ color: #4dc8a0; }}
+  .temp-warm  {{ color: #f0c040; }}
+  .temp-hot   {{ color: #f06060; }}
+  .fan-active {{ color: var(--accent); }}
+  .fan-off    {{ color: var(--muted); }}
 
   .pipeline-card {{
     background: var(--surface); border: 1px solid var(--border);
@@ -1242,62 +1930,56 @@ def render_dashboard(
   .theme-toggle:hover {{ background: var(--accent-bdr); }}
   .theme-toggle .theme-icon {{ font-size: 12px; }}
 
-  /* ── Light theme ── */
-  [data-theme="light"] body              {{ background: #f2f2f0; }}
-  [data-theme="light"] .card.live        {{ border-left: 3px solid rgba(180,0,0,.35); }}
-  [data-theme="light"] .card-thumb       {{ background: #ebebea; border-color: #d8d8d6; }}
-  [data-theme="light"] .thumb-num        {{ color: #ccc; }}
-  [data-theme="light"] .vd-inner         {{ background: #f8f8f8; border-color: #ddd; }}
-  [data-theme="light"] .vd-header        {{ background: #eee; border-color: #ddd; color: #999; }}
-  [data-theme="light"] .vd-ip            {{ color: #2563eb; }}
-  [data-theme="light"] .vd-dur           {{ color: #bbb; }}
-  [data-theme="light"] .vd-empty         {{ color: #bbb; }}
-  [data-theme="light"] .sys-stat         {{ color: #bbb; }}
-  [data-theme="light"] .q-input          {{ background: #f8f8f8; border-color: #ccc; color: #111; }}
-  [data-theme="light"] .q-btn            {{ background: rgba(0,0,0,.05); border-color: rgba(0,0,0,.14); color: #333; }}
-  [data-theme="light"] .q-btn:hover      {{ background: rgba(0,0,0,.1); }}
-  [data-theme="light"] .adb-panel        {{ background: #f8f8f8; border-color: #ddd; }}
-  [data-theme="light"] .adb-ip-input     {{ background: #fff; border-color: #ccc; color: #111; }}
-  [data-theme="light"] .adb-save-btn     {{ background: rgba(37,99,235,.07); border-color: rgba(37,99,235,.2); color: #2563eb; }}
-  [data-theme="light"] .adb-btn          {{ background: #f0f0f0; border-color: #d0d0d0; color: #333; }}
-  [data-theme="light"] .adb-btn:hover    {{ background: #e0e0e0; color: #000; }}
-  [data-theme="light"] .adb-center       {{ background: rgba(0,0,0,.06); border-color: rgba(0,0,0,.18); color: #111; }}
-  [data-theme="light"] .adb-home         {{ background: rgba(37,99,235,.06); border-color: rgba(37,99,235,.2); color: #2563eb; }}
+  /* ── Studio Pro (light) theme overrides ── */
+  [data-theme="light"] body              {{ background: #f3f5fa; }}
+  [data-theme="light"] .card.live        {{ border-left: 3px solid rgba(77,159,255,.5); }}
+  [data-theme="light"] .card-thumb       {{ background: #edf0f8; border-color: #c8cedd; }}
+  [data-theme="light"] .thumb-num        {{ color: #c0c8de; }}
+  [data-theme="light"] .vd-inner         {{ background: #f8f9fd; border-color: #c8cedd; }}
+  [data-theme="light"] .vd-header        {{ background: #edf0f8; border-color: #c8cedd; color: #6878a8; }}
+  [data-theme="light"] .vd-ip            {{ color: #4d9fff; }}
+  [data-theme="light"] .vd-dur           {{ color: #b0b8d0; }}
+  [data-theme="light"] .vd-empty         {{ color: #b0b8d0; }}
+  [data-theme="light"] .sys-stat         {{ color: #b0b8d0; }}
+  [data-theme="light"] .q-input          {{ background: #fff; border-color: #c8cedd; color: #1a1f38; }}
+  [data-theme="light"] .q-btn            {{ background: rgba(77,159,255,.08); border-color: rgba(77,159,255,.2); color: #4d9fff; }}
+  [data-theme="light"] .q-btn:hover      {{ background: rgba(77,159,255,.16); }}
+  [data-theme="light"] .adb-panel        {{ background: #f8f9fd; border-color: #c8cedd; }}
+  [data-theme="light"] .adb-ip-input     {{ background: #fff; border-color: #c8cedd; color: #1a1f38; }}
+  [data-theme="light"] .adb-save-btn     {{ background: rgba(77,159,255,.08); border-color: rgba(77,159,255,.2); color: #4d9fff; }}
+  [data-theme="light"] .adb-btn          {{ background: #edf0f8; border-color: #c8cedd; color: #1a1f38; }}
+  [data-theme="light"] .adb-btn:hover    {{ background: #dde2f0; color: #000; }}
+  [data-theme="light"] .adb-center       {{ background: rgba(77,159,255,.1); border-color: rgba(77,159,255,.25); color: #1a6fd4; }}
+  [data-theme="light"] .adb-home         {{ background: rgba(77,159,255,.08); border-color: rgba(77,159,255,.2); color: #4d9fff; }}
   [data-theme="light"] .adb-back         {{ background: rgba(217,119,6,.06); border-color: rgba(217,119,6,.2); color: #d97706; }}
-  [data-theme="light"] .adb-status       {{ color: #bbb; }}
-  [data-theme="light"] .adb-status.ok    {{ color: #2563eb; }}
-  [data-theme="light"] .adb-status.err   {{ color: #c00; }}
-  [data-theme="light"] .manage-item      {{ background: #f8f8f8; border-color: #e0e0e0; color: #111; }}
-  [data-theme="light"] .manage-item:hover {{ background: #f0f0f0; }}
-  [data-theme="light"] .btn-abort        {{ background: #f0f0f0; border-color: #ccc !important; color: #555; }}
-  [data-theme="light"] .btn-commit       {{ background: rgba(22,163,74,.08); border-color: rgba(22,163,74,.25) !important; color: #15803d; }}
+  [data-theme="light"] .adb-status       {{ color: #b0b8d0; }}
+  [data-theme="light"] .adb-status.ok    {{ color: #4d9fff; }}
+  [data-theme="light"] .adb-status.err   {{ color: #dc2626; }}
+  [data-theme="light"] .manage-item      {{ background: #f8f9fd; border-color: #c8cedd; color: #1a1f38; }}
+  [data-theme="light"] .manage-item:hover {{ background: #edf0f8; }}
+  [data-theme="light"] .btn-abort        {{ background: #edf0f8; border-color: #c8cedd !important; color: #6878a8; }}
+  [data-theme="light"] .btn-commit       {{ background: rgba(5,150,105,.08); border-color: rgba(5,150,105,.25) !important; color: #059669; }}
   [data-theme="light"] .form-grid input,
-  [data-theme="light"] .form-grid select {{ background: #f8f8f8; border-color: #ccc; color: #111; }}
-  [data-theme="light"] .pipeline-select  {{ background: #f8f8f8; border-color: #ccc; color: #111; }}
-  [data-theme="light"] .confirm-box      {{ background: #fff; border-color: #ddd; }}
-  [data-theme="light"] .modal            {{ background: #fff; border-color: #ddd; }}
-  [data-theme="light"] .modal-close      {{ color: #bbb; }}
-  [data-theme="light"] .modal-close:hover {{ color: #666; }}
-  [data-theme="light"] #hub-toast        {{ background: #fff; border-color: #ddd; color: #111; }}
-  [data-theme="light"] .sig-locked       {{ background: rgba(22,163,74,.08); border-color: rgba(22,163,74,.2); color: #15803d; }}
-  [data-theme="light"] .sig-other        {{ background: rgba(0,0,0,.04); border-color: #d8d8d6; color: #999; }}
-  [data-theme="light"] .section-lbl      {{ color: #bbb; }}
-  [data-theme="light"] .btn-manage       {{ background: rgba(0,0,0,.04); border-color: rgba(0,0,0,.1); color: #777; }}
-  [data-theme="light"] .btn-manage:hover {{ background: rgba(0,0,0,.08); color: #333; }}
-  [data-theme="light"] .rescan-btn       {{ background: rgba(0,0,0,.04); border-color: rgba(0,0,0,.1); color: #777; }}
+  [data-theme="light"] .form-grid select {{ background: #fff; border-color: #c8cedd; color: #1a1f38; }}
+  [data-theme="light"] .pipeline-select  {{ background: #fff; border-color: #c8cedd; color: #1a1f38; }}
+  [data-theme="light"] .confirm-box      {{ background: #fff; border-color: #c8cedd; }}
+  [data-theme="light"] .modal            {{ background: #fff; border-color: #c8cedd; }}
+  [data-theme="light"] .modal-close      {{ color: #b0b8d0; }}
+  [data-theme="light"] .modal-close:hover {{ color: #6878a8; }}
+  [data-theme="light"] #hub-toast        {{ background: #fff; border-color: #c8cedd; color: #1a1f38; }}
+  [data-theme="light"] .sig-locked       {{ background: rgba(5,150,105,.08); border-color: rgba(5,150,105,.2); color: #059669; }}
+  [data-theme="light"] .sig-other        {{ background: #edf0f8; border-color: #c8cedd; color: #6878a8; }}
+  [data-theme="light"] .section-lbl      {{ color: #b0b8d0; }}
+  [data-theme="light"] .btn-manage       {{ background: rgba(77,159,255,.06); border-color: rgba(77,159,255,.15); color: #4d9fff; }}
+  [data-theme="light"] .btn-manage:hover {{ background: rgba(77,159,255,.12); color: #1a6fd4; }}
+  [data-theme="light"] .rescan-btn       {{ background: rgba(77,159,255,.06); border-color: rgba(77,159,255,.15); color: #4d9fff; }}
 
-  /* ── Mono theme ── */
-  [data-theme="mono"] .card-thumb        {{ background: #040404; border-color: #1c1c1c; }}
-  [data-theme="mono"] .card-thumb::after {{
-    content: '';
-    position: absolute; inset: 0;
-    background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(255,255,255,.025) 2px, rgba(255,255,255,.025) 4px);
-    pointer-events: none;
-  }}
-  [data-theme="mono"] .card-sub          {{ font-family: 'IBM Plex Mono', monospace; letter-spacing: .03em; font-size: 10px; }}
-  [data-theme="mono"] .sig-locked        {{ background: rgba(255,255,255,.05); border-color: rgba(255,255,255,.15); color: #ccc; }}
-  [data-theme="mono"] .sig-other         {{ background: rgba(255,255,255,.03); border-color: #222; color: #444; }}
-  [data-theme="mono"] .viewers-chip      {{ background: rgba(255,255,255,.05); border-color: rgba(255,255,255,.14); color: #888; }}
+  /* ── Broadcast Orange (mono) theme overrides ── */
+  [data-theme="mono"] .card-thumb        {{ background: #070604; border-color: #2a1e08; }}
+  [data-theme="mono"] .card-sub          {{ letter-spacing: .03em; font-size: 10px; }}
+  [data-theme="mono"] .sig-locked        {{ background: rgba(255,102,0,.1); border-color: rgba(255,102,0,.25); color: #ff6600; }}
+  [data-theme="mono"] .sig-other         {{ background: rgba(255,102,0,.04); border-color: #2a1e08; color: #5a3818; }}
+  [data-theme="mono"] .viewers-chip      {{ background: rgba(255,102,0,.08); border-color: rgba(255,102,0,.2); color: #ff6600; }}
   [data-theme="mono"] .viewers-chip:hover {{ background: rgba(255,255,255,.1); }}
   [data-theme="mono"] .vd-inner          {{ background: #050505; border-color: #1c1c1c; }}
   [data-theme="mono"] .vd-header         {{ background: #0a0a0a; border-color: #1c1c1c; }}
@@ -1339,19 +2021,6 @@ def render_dashboard(
   }}
   .enc-select:focus {{ border-color: var(--accent); box-shadow: 0 0 0 2px rgba(232,255,71,.1); }}
 
-  /* ── Driver badges ── */
-  .driver-badge-mw {{
-    right: 4px; bottom: 4px;
-    background: rgba(74,158,255,.1); border: 1px solid rgba(74,158,255,.25);
-    color: var(--blue);
-  }}
-  .driver-badge-dl {{
-    right: 4px; bottom: 4px;
-    background: rgba(180,100,255,.1); border: 1px solid rgba(180,100,255,.25);
-    color: var(--purple);
-  }}
-
-  /* ── Decklink config panel ── */
   .dl-panel {{ margin-top: 10px; }}
   .dl-panel-hdr {{
     font-size: 10px; font-weight: 900; text-transform: uppercase; letter-spacing: .1em;
@@ -1363,6 +2032,9 @@ def render_dashboard(
   .dl-section-lbl {{
     font-size: 9px; font-weight: 900; text-transform: uppercase; letter-spacing: .15em;
     color: #3a3a3a; margin-bottom: 5px;
+  }}
+  .dl-grid {{
+    display: grid; grid-template-columns: 56px 1fr; gap: 5px 8px; align-items: center;
   }}
   .dl-fmt-row {{
     display: flex; align-items: center; gap: 6px; margin-bottom: 8px;
@@ -1378,16 +2050,6 @@ def render_dashboard(
   }}
   .dl-refresh-btn:hover {{ background: rgba(180,100,255,.2); }}
   .dl-refresh-btn:disabled {{ opacity: .35; cursor: not-allowed; }}
-  .dl-fmt-status {{
-    font-size: 10px; min-height: 14px; margin-bottom: 6px;
-    font-family: 'Courier New', monospace; transition: color .3s;
-  }}
-  .dl-fmt-status.ok      {{ color: var(--green); }}
-  .dl-fmt-status.err     {{ color: var(--live); }}
-  .dl-fmt-status.loading {{ color: var(--muted); }}
-  .dl-grid {{
-    display: grid; grid-template-columns: 56px 1fr; gap: 5px 8px; align-items: center;
-  }}
   .dl-lfe-row {{
     display: flex; align-items: flex-start; gap: 7px; margin-top: 8px;
     font-size: 11px; color: var(--muted); cursor: pointer; line-height: 1.4;
@@ -1406,6 +2068,19 @@ def render_dashboard(
   .mw-la-val {{
     font-size: 11px; font-family: 'Courier New', monospace;
     color: var(--accent); min-width: 22px; text-align: right;
+  }}
+  .mw-edid-status {{
+    font-size: 10px; min-height: 14px;
+    font-family: 'Courier New', monospace; transition: color .3s;
+  }}
+  .mw-edid-status.ok  {{ color: var(--green); }}
+  .mw-edid-status.err {{ color: var(--live); }}
+  .mw-edid-console {{
+    margin-top: 8px;
+    background: #020202; border: 1px solid #1e1e1e; border-radius: 4px;
+    padding: 8px 10px; max-height: 200px; overflow-y: auto;
+    font-family: 'Courier New', monospace; font-size: 10px;
+    line-height: 1.6; color: #aaa; white-space: pre-wrap; word-break: break-all;
   }}
   [data-theme="light"] .dl-lfe-row  {{ color: #666; }}
   [data-theme="light"] .dl-lfe-hint {{ color: #bbb; }}
@@ -1492,15 +2167,11 @@ def render_dashboard(
 
   function buildInputCard(id) {{
     const m=inputMeta[id]||{{}};
-    const driver=m.driver||'magewell';
-    const drvCls=driver==='decklink'?'driver-badge-dl':'driver-badge-mw';
-    const drvTxt=driver==='decklink'?'DL':'MW';
     const encOpts=availEncoders.map(e=>`<option value="${{e.value}}"${{e.value===(m.encoder||'')?' selected':''}}>${{e.label}}</option>`).join('');
     return `<div class="card row-entering" id="card-${{id}}" style="opacity:.5">
       <div class="card-body">
         <div class="card-thumb" id="thumb-${{id}}">
           <div class="thumb-num" style="font-style:italic">${{id}}</div>
-          <div class="thumb-badge ${{drvCls}}">${{drvTxt}}</div>
         </div>
         <div class="card-info">
           <div class="card-title">${{m.label||id}}</div>
@@ -1586,9 +2257,6 @@ def render_dashboard(
         if(isLive)  badges+=`<div class="thumb-badge live-badge"><span class="blink-dot"></span> Live</div>`;
         if(isHls)   badges+=`<div class="thumb-badge hls-badge-th"><span class="blink-dot hls-dot-col"></span> HLS</div>`;
         if(!isLive) badges+=`<div class="no-sig">No Signal</div>`;
-        const drvCls = driver==='decklink' ? 'driver-badge-dl' : 'driver-badge-mw';
-        const drvTxt = driver==='decklink' ? 'DL' : 'MW';
-        badges+=`<div class="thumb-badge ${{drvCls}}">${{drvTxt}}</div>`;
         Array.from(thumb.children).forEach(c=>{{ if(!c.classList.contains('thumb-num')) c.remove(); }});
         thumb.insertAdjacentHTML('beforeend', badges);
       }}
@@ -1630,9 +2298,9 @@ def render_dashboard(
       const es=document.getElementById('enc-select-'+id);
       if(es && document.activeElement!==es && m.encoder) es.value=m.encoder;
 
-      // Q row visibility (hide for Decklink CBR)
+      // Q row is always visible (Decklink CBR mode removed)
       const qrow=document.getElementById('qrow-'+id);
-      if(qrow) qrow.style.display=(driver==='decklink' && m.quality_mode==='cbr')?'none':'';
+      if(qrow) qrow.style.display='';
 
       // Ctrl buttons (only rebuild on state change)
       const prev=_prevState[id]||{{}};
@@ -1648,6 +2316,7 @@ def render_dashboard(
       const el=document.getElementById('rec-elapsed-'+r.id);
       if(el) el.textContent='● REC '+fmtElapsed(r.elapsed)+(r.duration?' / '+fmtElapsed(r.duration):'');
     }});
+    if (data.fan_profile) _ccUpdateBadge(data.fan_profile);
   }}
 
   function updateInputSelects(ids) {{
@@ -1660,15 +2329,7 @@ def render_dashboard(
   document.addEventListener('DOMContentLoaded', () => {{
     (function connectSSE() {{
       const es=new EventSource('/api/stats');
-      es.onmessage=e=>{{
-        try{{
-          const data = JSON.parse(e.data);
-          console.log('[SSE] driver_missing=', data.driver_missing, 'installer_path=', data.installer_path);
-          const banner = document.getElementById('driver-banner');
-          console.log('[SSE] banner element=', banner);
-          applyStats(data);
-        }}catch(err){{ console.warn('SSE error:',err); }}
-      }};
+      es.onmessage=e=>{{ try{{ applyStats(JSON.parse(e.data)); }}catch(err){{ console.warn('SSE',err); }} }};
       es.onerror=()=>{{ es.close(); setTimeout(connectSSE,3000); }};
     }})();
   }});
@@ -1855,7 +2516,8 @@ def render_dashboard(
   }}
 
   // ── Manage inputs overlay ────────────────────────────────────────────────────
-  let _manageHiddenSet = new Set();
+  let _manageHiddenSet  = new Set();
+  let _manageShowHidden = false;
 
   async function openManage() {{
     const btn = document.getElementById('manage-refresh-btn');
@@ -1870,35 +2532,82 @@ def render_dashboard(
       return;
     }}
     _manageHiddenSet = new Set(data.inputs.filter(i => i.hidden).map(i => i.key));
-    const list = document.getElementById('manage-list');
-    list.innerHTML = data.inputs.map(inp => {{
-      const dimmed = (inp.signal === 'NONE' || inp.signal === 'UNKNOWN') ? 'opacity:0.6;' : '';
-      const drvBadge = inp.driver === 'decklink'
-        ? `<span style="color:var(--purple);font-weight:900;font-size:9px;border:1px solid rgba(180,100,255,.3);padding:1px 5px;border-radius:3px">DL</span>`
-        : `<span style="color:var(--blue);font-weight:900;font-size:9px;border:1px solid rgba(74,158,255,.3);padding:1px 5px;border-radius:3px">MW</span>`;
+    _renderManageList(data.inputs);
+    if (btn) {{ btn.disabled = false; btn.textContent = '↺ Refresh'; }}
+    document.getElementById('manage-overlay').classList.add('show');
+  }}
+
+  function _renderManageList(inputs) {{
+    const list       = document.getElementById('manage-list');
+    const toggleBtn  = document.getElementById('manage-show-hidden-btn');
+    const hiddenCount = inputs.filter(i => i.hidden).length;
+    if (toggleBtn) {{
+      toggleBtn.textContent = _manageShowHidden ? '▲ Hide restored' : `▼ Show hidden (${{hiddenCount}})`;
+      toggleBtn.style.display = hiddenCount > 0 ? '' : 'none';
+    }}
+    list.innerHTML = inputs.map(inp => {{
+      const dimmed   = (inp.signal === 'NONE' || inp.signal === 'UNKNOWN') ? 'opacity:0.6;' : '';
+      if (inp.hidden) {{
+        if (!_manageShowHidden) return '';
+        return `<div class="manage-item manage-item-hidden" style="opacity:0.45;gap:8px;cursor:default">
+          <span style="flex:1;font-size:11px">${{inp.label}}</span>
+          <span style="color:#3a3a3a;font-weight:700;font-size:10px">[${{inp.signal}}]</span>
+          <button class="btn btn-manage" style="font-size:9px;padding:3px 9px;white-space:nowrap"
+            onclick="restoreInput('${{inp.key}}')">&#8629; Restore</button>
+        </div>`;
+      }}
       return `<label class="manage-item" style="${{dimmed}}">
         <input type="checkbox" value="${{inp.key}}" ${{inp.active ? 'checked' : ''}}>
         <span style="flex:1">${{inp.label}}</span>
-        ${{drvBadge}}
         <span style="color:#3a3a3a;font-weight:700;font-size:10px">[${{inp.signal}}]</span>
       </label>`;
     }}).join('');
-    if (btn) {{ btn.disabled = false; btn.textContent = '↺ Refresh'; }}
-    document.getElementById('manage-overlay').classList.add('show');
   }}
 
   async function refreshManage() {{
     const btn = document.getElementById('manage-refresh-btn');
     if (btn) {{ btn.disabled = true; btn.textContent = 'Scanning…'; }}
-    try {{ await fetch('/inputs/rescan', {{method: 'POST'}}); }} catch(e) {{}}
+    try {{
+      const res  = await fetch('/inputs/rescan', {{method: 'POST'}});
+      const data = await res.json();
+      if (data.remapped && data.remapped.length > 0) {{
+        const msgs = data.remapped.map(r => `${{r.from}} → ${{r.to}} (${{r.reason}})`);
+        showToast('Remapped: ' + msgs.join(', '));
+      }} else if (data.added && data.added.length > 0) {{
+        showToast('Found ' + data.added.length + ' new input(s)');
+      }}
+    }} catch(e) {{}}
     await openManage();
   }}
 
-  function closeManage() {{ document.getElementById('manage-overlay').classList.remove('show'); }}
+  function closeManage() {{
+    document.getElementById('manage-overlay').classList.remove('show');
+    _manageShowHidden = false;
+  }}
+
+  function toggleManageHidden() {{
+    _manageShowHidden = !_manageShowHidden;
+    openManage();
+  }}
+
+  async function restoreInput(key) {{
+    try {{
+      const res  = await fetch('/input/' + key + '/restore', {{method: 'POST'}});
+      const data = await res.json();
+      if (data.ok) {{
+        showToast('Input restored — reloading…');
+        setTimeout(() => location.reload(), 800);
+      }} else {{
+        showToast(data.error || 'Restore failed', false);
+      }}
+    }} catch(e) {{
+      showToast('Network error', false);
+    }}
+  }}
 
   async function applyManage() {{
-    const checked = new Set(Array.from(document.querySelectorAll('#manage-list input:checked')).map(i => i.value));
-    const allKeys = Array.from(document.querySelectorAll('#manage-list input[type=checkbox]')).map(i => i.value);
+    const checked   = new Set(Array.from(document.querySelectorAll('#manage-list input:checked')).map(i => i.value));
+    const allKeys   = Array.from(document.querySelectorAll('#manage-list input[type=checkbox]')).map(i => i.value);
     const newHidden = new Set([..._manageHiddenSet]);
     for (const k of allKeys) {{
       if (checked.has(k)) newHidden.delete(k);
@@ -1970,177 +2679,75 @@ def render_dashboard(
     }} catch(e) {{ showToast('Network error', false); }}
   }}
 
-  // ── Decklink config panel ─────────────────────────────────────────────────────
-  const _dlFormatsLoaded = new Set();  // track which inputs have been queried
-
-  function toggleDlPanel(inputId) {{
-    const body  = document.getElementById('dlbody-'+inputId);
-    const caret = document.getElementById('dlcaret-'+inputId);
-    if (!body) return;
-    const open = body.style.display === 'none';
-    body.style.display  = open ? '' : 'none';
-    if (caret) caret.style.transform = open ? 'rotate(180deg)' : '';
-  }}
-
-  async function loadDlFormats(inputId) {{
-    const sel    = document.getElementById('dl-fmt-'+inputId);
-    const btn    = document.getElementById('dl-fmtbtn-'+inputId);
-    const status = document.getElementById('dl-fmtstatus-'+inputId);
-    if (!sel) return;
-
-    if (btn)    {{ btn.disabled = true; btn.textContent = '…'; }}
-    if (status) {{ status.textContent = 'Querying device…'; status.className = 'dl-fmt-status loading'; }}
-
-    try {{
-      const res  = await fetch('/input/'+inputId+'/decklink_formats');
-      const data = await res.json();
-
-      if (!data.ok) {{
-        if (status) {{
-          status.textContent = data.error || 'Failed to load formats';
-          status.className   = 'dl-fmt-status err';
-        }}
-        return;
-      }}
-
-      // Rebuild the select with real options, preserving the saved selection
-      const current = data.current || sel.value;
-      sel.innerHTML = data.formats.map(f => {{
-        const label    = f.mode ? `${{f.label}} (${{f.code}})` : f.label;
-        const selected = (f.code === current || f.mode === current) ? ' selected' : '';
-        const value    = f.code || f.mode;
-        return `<option value="${{value}}"${{selected}}>${{label}}</option>`;
-      }}).join('');
-
-      // If nothing matched the saved value, prepend it so it's not silently lost
-      if (!data.formats.some(f => f.code === current || f.mode === current)) {{
-        sel.insertAdjacentHTML('afterbegin',
-          `<option value="${{current}}" selected>${{current}} (saved)</option>`);
-      }}
-
-      _dlFormatsLoaded.add(inputId);
-      if (status) {{
-        status.textContent = `${{data.formats.length}} format${{data.formats.length !== 1 ? 's' : ''}} available`;
-        status.className   = 'dl-fmt-status ok';
-      }}
-    }} catch(e) {{
-      if (status) {{ status.textContent = 'Network error'; status.className = 'dl-fmt-status err'; }}
-    }} finally {{
-      if (btn) {{ btn.disabled = false; btn.textContent = '↺'; }}
-    }}
-  }}
-
-  function dlToggleMode(inputId) {{
-    const mode  = document.getElementById('dl-qmode-'+inputId)?.value;
-    const qrow  = document.getElementById('qrow-'+inputId);
-    const vblbl = document.getElementById('dl-vblbl-'+inputId);
-    const vbr   = document.getElementById('dl-vbr-'+inputId);
-    if (qrow)  qrow.style.display  = (mode === 'cbr') ? 'none' : '';
-    if (vblbl) vblbl.style.display = (mode === 'cbr') ? '' : 'none';
-    if (vbr)   vbr.style.display   = (mode === 'cbr') ? '' : 'none';
-  }}
-
-  // Called when audio codec or channel layout changes.
-  // Shows a warning if the selected codec can't handle the chosen channel count,
-  // and shows/hides the LFE swap option for surround layouts.
-  function dlUpdateAudioOptions(inputId) {{
-    const codecSel  = document.getElementById('dl-acodec-'+inputId);
-    const layoutSel = document.getElementById('dl-layout-'+inputId);
-    const lfeRow    = document.getElementById('dl-lfe-row-'+inputId);
-    const warnEl    = document.getElementById('dl-audio-warn-'+inputId);
-    if (!codecSel || !layoutSel) return;
-
-    const codecVal  = codecSel.value;
-    const layoutVal = layoutSel.value;
-
-    // Look up max channels for this codec
-    const codecMeta  = availAudioCodecs.find(c => c.value === codecVal) || {{}};
-    const maxCh      = codecMeta.max_ch || 2;
-
-    // Look up output channels for the chosen layout
-    const layoutMeta = availChLayouts.find(cl => cl.value === layoutVal) || {{}};
-    const outCh      = layoutMeta.out_ch || 2;
-
-    // Show/hide LFE swap checkbox — only relevant for surround
-    const isSurround = ['5.1','7.1','8ch'].includes(layoutVal);
-    if (lfeRow) lfeRow.style.display = isSurround ? '' : 'none';
-
-    // Warn if codec can't handle channel count
-    if (warnEl) {{
-      if (outCh > maxCh) {{
-        warnEl.textContent = `⚠ ${{codecMeta.label || codecVal}} supports max ${{maxCh}} channels — layout will be downmixed.`;
-        warnEl.style.display = '';
-      }} else {{
-        warnEl.style.display = 'none';
-      }}
-    }}
-  }}
-
-  async function submitDlCfg(inputId) {{
-    const fd = new FormData();
-    fd.append('format_code',    document.getElementById('dl-fmt-'+inputId)?.value    || 'hp50');
-    fd.append('quality_mode',   document.getElementById('dl-qmode-'+inputId)?.value  || 'cqp');
-    fd.append('video_bitrate',  document.getElementById('dl-vbr-'+inputId)?.value    || '50M');
-    fd.append('audio_bitrate',  document.getElementById('dl-abr-'+inputId)?.value    || '128k');
-    fd.append('video_filter',   document.getElementById('dl-vf-'+inputId)?.value     || 'yadif=1,scale=1920:1080');
-    fd.append('gop',            document.getElementById('dl-gop-'+inputId)?.value    || '90');
-    fd.append('audio_codec',    document.getElementById('dl-acodec-'+inputId)?.value || 'aac');
-    fd.append('channel_layout', document.getElementById('dl-layout-'+inputId)?.value || 'stereo');
-    fd.append('fix_lfe_swap',   document.getElementById('dl-lfe-'+inputId)?.checked ? '1' : '0');
-    try {{
-      const res  = await fetch('/input/'+inputId+'/set_decklink_cfg', {{method:'POST', body:fd}});
-      const data = await res.json();
-      if (data.ok) showToast(data.restarted ? 'Decklink config saved · restarting…' : 'Decklink config saved');
-      else showToast(data.error || 'Failed to save', false);
-    }} catch(e) {{ showToast('Network error', false); }}
-  }}
-
   // ── ADB ──────────────────────────────────────────────────────────────────────
   var _activeAdbInputId=null, _adbKeyboardActive=false;
   const KEY_MAP={{'ArrowUp':'up','ArrowDown':'down','ArrowLeft':'left','ArrowRight':'right','Enter':'enter','Backspace':'back'}};
 
-  async function adbKey(key) {{
-    if(!_activeAdbInputId) return;
-    const fd=new FormData(); fd.append('key',key);
-    try {{
-      const res=await fetch(`/input/${{_activeAdbInputId}}/adb_key`,{{method:'POST',body:fd}});
-      const data=await res.json();
-      const st=document.getElementById('adb-status');
-      if(data.ok){{ st.textContent=`↑ ${{key}}`; st.className='adb-status ok'; }}
-      else        {{ st.textContent='Error';      st.className='adb-status err'; }}
-    }} catch(e) {{}}
+  // ── Unified remote ───────────────────────────────────────────────────────────
+
+  function onRemoteTypeChange() {{
+    const sel = document.getElementById('remote-type-sel');
+    const ipRow = document.getElementById('remote-ip-row');
+    const btnRow = document.getElementById('remote-buttons');
+    const isNone = sel.value === 'none';
+    ipRow.style.display  = isNone ? 'none' : '';
+    btnRow.style.display = isNone ? 'none' : '';
+    // Update IP field placeholder
+    const field = document.getElementById('adb-ip-field');
+    if (field) field.placeholder = sel.value === 'roku' ? 'Roku IP (e.g. 192.168.1.150)' : 'Device IP';
   }}
 
-  async function saveAdbIp(inputId) {{
-    const ip = document.getElementById('adb-ip-field').value.trim();
-    if (!ip) {{ showToast('Enter an IP address first', false); return; }}
-    const btn = document.querySelector(`[onclick="saveAdbIp('${{inputId}}')"], .adb-save-btn`);
+  async function saveRemote(inputId) {{
+    const type = document.getElementById('remote-type-sel').value;
+    const ip   = document.getElementById('adb-ip-field').value.trim();
+    if (type !== 'none' && !ip) {{ showToast('Enter an IP address first', false); return; }}
+    const btn = document.querySelector('.adb-save-btn');
     if (btn) {{ btn.textContent = 'Connecting…'; btn.disabled = true; }}
-    const fd = new FormData(); fd.append('adb_ip', ip);
+    const fd = new FormData();
+    fd.append('remote_type', type);
+    fd.append('remote_ip',   ip);
     try {{
-      const res = await fetch(`/input/${{inputId}}/set_adb_ip`, {{method:'POST', body:fd}});
+      const res  = await fetch(`/input/${{inputId}}/set_remote`, {{method:'POST', body:fd}});
       const data = await res.json();
+      const st   = document.getElementById('adb-status');
       if (data.connected) {{
-        showToast(`✓ Connected — ${{ip}}`, true);
-      }} else if (data.adb_ip && data.connect_msg) {{
-        showToast(`Saved — ${{data.connect_msg}}`, false);
+        showToast(`✓ Connected — ${{ip}}`);
+        if (st) {{ st.textContent = `linked ${{ip}}`; st.className = 'adb-status ok'; }}
+        document.getElementById('remote-buttons').style.display = '';
       }} else {{
-        showToast(data.error || 'Failed to save', false);
+        showToast(data.connect_msg || 'Saved (not verified)', false);
+        if (st) {{ st.textContent = data.connect_msg || 'not verified'; st.className = 'adb-status err'; }}
       }}
-      const st = document.getElementById('adb-status');
-      if (st) {{
-        st.textContent = data.connected ? `linked ${{ip}}` : (data.connect_msg || 'not connected');
-        st.className = 'adb-status ' + (data.connected ? 'ok' : 'err');
-      }}
-      // Immediately show/hide the adb-home checkbox based on the saved IP
+      // Update home checkbox visibility — show for both ADB and Roku
       const homeRow = document.getElementById('rec-adb-home-row');
-      if (homeRow) homeRow.style.display = ip ? '' : 'none';
+      if (homeRow) homeRow.style.display = (type !== 'none' && ip) ? '' : 'none';
+      // Cache in inputMeta
+      if (inputMeta[inputId]) {{
+        inputMeta[inputId].remote_type = type;
+        inputMeta[inputId].remote_ip   = ip;
+        inputMeta[inputId].adb_ip      = type === 'adb' ? ip : '';
+      }}
     }} catch(e) {{
       showToast('Network error', false);
     }} finally {{
-      if (btn) {{ btn.textContent = 'Link TV'; btn.disabled = false; }}
+      if (btn) {{ btn.textContent = 'Link Device'; btn.disabled = false; }}
     }}
   }}
+
+  async function remoteKey(key) {{
+    if (!_activeAdbInputId) return;
+    const fd = new FormData(); fd.append('key', key);
+    try {{
+      const res  = await fetch(`/input/${{_activeAdbInputId}}/remote_key`, {{method:'POST', body:fd}});
+      const data = await res.json();
+      const st   = document.getElementById('adb-status');
+      if (data.ok) {{ if (st) {{ st.textContent = `↑ ${{key}}`; st.className = 'adb-status ok'; }} }}
+      else          {{ if (st) {{ st.textContent = data.error || 'Error'; st.className = 'adb-status err'; }} }}
+    }} catch(e) {{}}
+  }}
+
+  // Legacy wrapper — keyboard handler uses this
+  async function adbKey(key) {{ await remoteKey(key); }}
 
   // ── Preview modal ────────────────────────────────────────────────────────────
   const players={{}};
@@ -2163,19 +2770,36 @@ def render_dashboard(
     _activeAdbInputId=id; _adbKeyboardActive=true;
     document.getElementById('record-input-id').value=id;
     document.getElementById('record-title').textContent='Record — '+(inputMeta[id]?.label||id);
-    const _adbField = document.getElementById('adb-ip-field');
-    _adbField.value = inputMeta[id]?.adb_ip || '';
+
+    // Restore saved remote type and IP
+    const meta        = inputMeta[id] || {{}};
+    const remoteType  = meta.remote_type || (meta.adb_ip ? 'adb' : 'none');
+    const remoteIp    = meta.remote_ip   || meta.adb_ip || '';
+    // If we have an IP but type is still 'none' (pre-migration config), infer type
+    const effectiveType = (remoteType === 'none' && remoteIp)
+      ? (remoteIp === meta.adb_ip ? 'adb' : 'roku')
+      : remoteType;
+    const sel         = document.getElementById('remote-type-sel');
+    const ipField     = document.getElementById('adb-ip-field');
+    const ipRow       = document.getElementById('remote-ip-row');
+    const btnRow      = document.getElementById('remote-buttons');
+    if (sel)     sel.value     = effectiveType;
+    if (ipField) ipField.value = remoteIp;
+    if (ipField) ipField.placeholder = effectiveType === 'roku' ? 'Roku IP (e.g. 192.168.1.150)' : 'Device IP';
+    if (ipRow)   ipRow.style.display  = effectiveType !== 'none' ? '' : 'none';
+    if (btnRow)  btnRow.style.display = (effectiveType !== 'none' && remoteIp) ? '' : 'none';
+
     // Load the user's saved directory from the server
     fetch('/prefs/rec_dir').then(r=>r.json()).then(d=>{{
       document.getElementById('rec-dir').value = d.rec_dir || '';
     }}).catch(()=>{{}});
-    // Show/hide adb-home checkbox — re-check live field value, not stale meta
-    function _updateHomeRow() {{
-      const homeRow = document.getElementById('rec-adb-home-row');
-      if (homeRow) homeRow.style.display = _adbField.value.trim() ? '' : 'none';
-    }}
-    _updateHomeRow();
-    _adbField.oninput = _updateHomeRow;
+
+    // Show/hide home checkbox — relevant for both ADB and Roku
+    const homeRow  = document.getElementById('rec-adb-home-row');
+    const homeChk  = document.getElementById('rec-adb-home');
+    if (homeRow) homeRow.style.display = (effectiveType !== 'none' && remoteIp) ? '' : 'none';
+    if (homeChk) homeChk.checked = !!meta.adb_home;
+
     document.getElementById('record-overlay').classList.add('show');
     startPlayer('record-video',id);
   }}
@@ -2226,7 +2850,7 @@ def render_dashboard(
 
   // ── Theme toggle ─────────────────────────────────────────────────────────────
   const THEMES = ['dark', 'mono', 'light'];
-  const THEME_LABELS = {{ dark: '● Dark', mono: '◐ Mono', light: '○ Light' }};
+  const THEME_LABELS = {{ dark: '● Neon Ops', mono: '◐ Broadcast', light: '○ Studio Pro' }};
 
   function applyTheme(t) {{
     document.documentElement.setAttribute('data-theme', t);
@@ -2251,6 +2875,8 @@ def render_dashboard(
     if (caret) caret.style.transform = open ? 'rotate(180deg)' : '';
     // Populate preset dropdown based on current encoder when panel opens
     if (open) mwUpdatePresets(inputId);
+    // Scan for available EDID files when panel opens
+    if (open) mwLoadEdidList(inputId);
   }}
 
   // Rebuild the preset dropdown for this input based on its current encoder.
@@ -2277,17 +2903,128 @@ def render_dashboard(
 
   async function submitMwCfg(inputId) {{
     const fd = new FormData();
-    fd.append('preset',       document.getElementById('mw-preset-'+inputId)?.value || '');
-    fd.append('lookahead',    document.getElementById('mw-la-'+inputId)?.value     || '35');
-    fd.append('p010',         document.getElementById('mw-p010-'+inputId)?.checked  ? '1' : '0');
-    fd.append('no_audio',     document.getElementById('mw-noa-'+inputId)?.checked   ? '1' : '0');
-    fd.append('vaapi_device', document.getElementById('mw-dev-'+inputId)?.value     || '');
+    fd.append('preset',          document.getElementById('mw-preset-'+inputId)?.value || '');
+    fd.append('lookahead',       document.getElementById('mw-la-'+inputId)?.value     || '35');
+    fd.append('gop_secs',        document.getElementById('mw-gop-'+inputId)?.value    || '1.5');
+    fd.append('gpu_buffers',     document.getElementById('mw-gpu-'+inputId)?.value    || '16');
+    fd.append('video_buffers',   document.getElementById('mw-vbuf-'+inputId)?.value   || '16');
+    fd.append('extra_hw_frames', document.getElementById('mw-ehf-'+inputId)?.value    || '32');
+    fd.append('p010',            document.getElementById('mw-p010-'+inputId)?.checked  ? '1' : '0');
+    fd.append('no_audio',        document.getElementById('mw-noa-'+inputId)?.checked   ? '1' : '0');
+    fd.append('vaapi_device',    document.getElementById('mw-dev-'+inputId)?.value     || '');
+    fd.append('edid_path',       document.getElementById('mw-edid-path-'+inputId)?.value.trim() || '');
+    fd.append('edid_refresh',    document.getElementById('mw-edid-refresh-chk-'+inputId)?.checked ? '1' : '0');
     try {{
       const res  = await fetch('/input/'+inputId+'/set_magewell_cfg', {{method:'POST', body:fd}});
       const data = await res.json();
       if (data.ok) showToast(data.restarted ? 'Magewell config saved · restarting…' : 'Magewell config saved');
       else showToast(data.error || 'Failed to save', false);
     }} catch(e) {{ showToast('Network error', false); }}
+  }}
+
+  // ── EDID management ──────────────────────────────────────────────────────────
+
+  function _mwEdidStatus(inputId, msg, cls='') {{
+    const el = document.getElementById('mw-edid-status-'+inputId);
+    if (!el) return;
+    el.textContent = msg;
+    el.className = 'mw-edid-status' + (cls ? ' '+cls : '');
+  }}
+
+  function _mwEdidConsole(inputId, text) {{
+    const el = document.getElementById('mw-edid-console-'+inputId);
+    if (!el) return;
+    el.style.display = '';
+    el.textContent = text;
+    el.scrollTop = el.scrollHeight;
+  }}
+
+  // When the dropdown changes, copy the path into the text field
+  function mwEdidSelChange(inputId) {{
+    const sel  = document.getElementById('mw-edid-sel-'+inputId);
+    const path = document.getElementById('mw-edid-path-'+inputId);
+    if (sel && path && sel.value) path.value = sel.value;
+  }}
+
+  // Scan for .bin files and populate the dropdown
+  async function mwLoadEdidList(inputId) {{
+    const btn = document.getElementById('mw-edid-refresh-'+inputId);
+    const sel = document.getElementById('mw-edid-sel-'+inputId);
+    if (btn) {{ btn.disabled = true; btn.textContent = '…'; }}
+    _mwEdidStatus(inputId, 'Scanning…');
+    try {{
+      const res  = await fetch('/input/'+inputId+'/edid/list');
+      const data = await res.json();
+      if (!data.ok) {{
+        _mwEdidStatus(inputId, data.error || 'Scan failed', 'err');
+        return;
+      }}
+      const saved = data.saved_edid || '';
+      sel.innerHTML = '<option value="">— select a .bin file —</option>';
+      for (const f of data.bins) {{
+        const opt = document.createElement('option');
+        opt.value = f.path;
+        opt.textContent = f.name;
+        if (f.path === saved) opt.selected = true;
+        sel.appendChild(opt);
+      }}
+      if (data.bins.length === 0) {{
+        _mwEdidStatus(inputId, 'No .bin files found — paste a path manually', 'err');
+      }} else {{
+        _mwEdidStatus(inputId, data.bins.length + ' file' + (data.bins.length !== 1 ? 's' : '') + ' found', 'ok');
+      }}
+    }} catch(e) {{
+      _mwEdidStatus(inputId, 'Network error', 'err');
+    }} finally {{
+      if (btn) {{ btn.disabled = false; btn.textContent = '↺'; }}
+    }}
+  }}
+
+  // Read current EDID from hardware and show decoded output
+  async function mwReadEdid(inputId) {{
+    _mwEdidStatus(inputId, 'Reading EDID from hardware…');
+    _mwEdidConsole(inputId, '');
+    try {{
+      const res  = await fetch('/input/'+inputId+'/edid/read');
+      const data = await res.json();
+      if (!data.ok) {{
+        _mwEdidStatus(inputId, data.error || 'Read failed', 'err');
+        _mwEdidConsole(inputId, data.error || '');
+        return;
+      }}
+      _mwEdidStatus(inputId, 'Read OK · ' + data.size + ' bytes', 'ok');
+      _mwEdidConsole(inputId, data.decoded);
+    }} catch(e) {{
+      _mwEdidStatus(inputId, 'Network error', 'err');
+    }}
+  }}
+
+  // Write selected/typed EDID path to hardware
+  async function mwWriteEdid(inputId) {{
+    const path = document.getElementById('mw-edid-path-'+inputId)?.value.trim();
+    if (!path) {{
+      _mwEdidStatus(inputId, 'Select or enter a .bin path first', 'err');
+      return;
+    }}
+    _mwEdidStatus(inputId, 'Writing EDID…');
+    const fd = new FormData();
+    fd.append('edid_path', path);
+    try {{
+      const res  = await fetch('/input/'+inputId+'/edid/write', {{method:'POST', body:fd}});
+      const data = await res.json();
+      if (!data.ok) {{
+        _mwEdidStatus(inputId, data.error || 'Write failed', 'err');
+        _mwEdidConsole(inputId, data.error || '');
+        return;
+      }}
+      _mwEdidStatus(inputId, '✓ EDID written successfully', 'ok');
+      if (data.output) _mwEdidConsole(inputId, data.output);
+      // Also persist the path into the config field so Save picks it up
+      const pathEl = document.getElementById('mw-edid-path-'+inputId);
+      if (pathEl) pathEl.value = path;
+    }} catch(e) {{
+      _mwEdidStatus(inputId, 'Network error', 'err');
+    }}
   }}
 
   // Restore saved theme on load
@@ -2298,15 +3035,211 @@ def render_dashboard(
     }} catch(e) {{}}
   }})();
 
-  // Pre-load Decklink format lists for all Decklink inputs at page load.
-  // Runs in parallel — each call is independent and failures are shown
-  // inline in the panel status line rather than blocking the page.
-  document.addEventListener('DOMContentLoaded', () => {{
-    const decklinkIds = {decklink_ids_js};
-    for (const id of decklinkIds) {{
-      loadDlFormats(id);
+  // ── System Telemetry ─────────────────────────────────────────────────────────
+
+  function _tempColor(t) {{
+    if (t === null || t === undefined) return 'temp-cool';
+    if (t >= 85) return 'temp-hot';
+    if (t >= 65) return 'temp-warm';
+    return 'temp-cool';
+  }}
+
+  function _tempBarColor(t) {{
+    if (t === null || t === undefined) return '#4dc8a0';
+    if (t >= 85) return '#f06060';
+    if (t >= 65) return '#f0c040';
+    return '#4dc8a0';
+  }}
+
+  function _tempBarWidth(t) {{
+    if (t === null || t === undefined) return 0;
+    return Math.min(100, Math.max(0, (t / 100) * 100));
+  }}
+
+  function _updateTempTile(elId, barId, temp) {{
+    const el  = document.getElementById(elId);
+    const bar = document.getElementById(barId);
+    if (!el) return;
+    if (temp === null || temp === undefined) {{ el.textContent = '—'; return; }}
+    el.textContent = temp.toFixed(1) + '°C';
+    el.className = 'telemetry-value ' + _tempColor(temp);
+    if (bar) {{
+      bar.style.width = _tempBarWidth(temp) + '%';
+      bar.style.background = _tempBarColor(temp);
     }}
-  }});
+  }}
+
+  async function _pollTelemetry() {{
+    try {{
+      const res  = await fetch('/telemetry');
+      const data = await res.json();
+      if (!data.ok) return;
+
+      // Fixed temp tiles
+      _updateTempTile('tel-cpu',  'tel-cpu-bar',  data.temps?.cpu?.value);
+      _updateTempTile('tel-igpu', 'tel-igpu-bar', data.temps?.igpu?.value);
+      _updateTempTile('tel-arc',  'tel-arc-bar',  data.temps?.arc?.value);
+
+      // Magewell input temps (dynamic)
+      const mwContainer = document.getElementById('tel-mw-tiles');
+      if (mwContainer) {{
+        const mwEntries = Object.entries(data.temps || {{}})
+          .filter(([k]) => k.startsWith('mw_'));
+        mwContainer.innerHTML = mwEntries.map(([k, v]) => `
+          <div class="telemetry-tile">
+            <div class="telemetry-label">${{v.label}}</div>
+            <div class="telemetry-value ${{_tempColor(v.value)}}">${{v.value?.toFixed(1)+'°C' || '—'}}</div>
+            <div class="telemetry-bar-track">
+              <div class="telemetry-bar-fill"
+                style="width:${{_tempBarWidth(v.value)}}%;background:${{_tempBarColor(v.value)}}"></div>
+            </div>
+          </div>`).join('');
+      }}
+
+      // Fan RPMs
+      const fanContainer = document.getElementById('telemetry-fans');
+      if (fanContainer && data.fans) {{
+        fanContainer.innerHTML = data.fans.map(f => {{
+          const active = f.rpm > 100;
+          const pct    = Math.min(100, (f.rpm / 3000) * 100);
+          return `
+          <div class="telemetry-tile">
+            <div class="telemetry-label">${{f.label}}</div>
+            <div class="telemetry-value ${{active?'fan-active':'fan-off'}}">${{f.rpm}}</div>
+            <div class="telemetry-sub">RPM</div>
+            <div class="telemetry-bar-track">
+              <div class="telemetry-bar-fill"
+                style="width:${{pct}}%;background:${{active?'var(--accent)':'var(--border)'}}"></div>
+            </div>
+          </div>`;
+        }}).join('');
+      }}
+    }} catch(e) {{}}
+  }}
+
+  // Poll telemetry every 5 seconds
+  _pollTelemetry();
+  setInterval(_pollTelemetry, 5000);
+
+  let _ccConfig = {{}};
+  let _ccModeList = [];
+
+  // Load CC config from fan_config on page load
+  (async function _ccInit() {{
+    try {{
+      const res  = await fetch('/fans/config');
+      const data = await res.json();
+      if (!data.ok) return;
+      _ccConfig = data.config?.coolercontrol || {{}};
+      const chk = document.getElementById('cc-enabled-chk');
+      const tok = document.getElementById('cc-token-input');
+      if (chk) chk.checked = !!_ccConfig.enabled;
+      if (tok) tok.value   = _ccConfig.token || '';
+      if (_ccConfig.token) await ccFetchModes(true);  // silent fetch on load
+    }} catch(e) {{}}
+  }})();
+
+  function ccToggleEnabled(val) {{
+    _ccConfig.enabled = val;
+  }}
+
+  function ccSetField(key, val) {{
+    _ccConfig[key] = val;
+  }}
+
+  function ccSetMode(key, uid) {{
+    _ccConfig[key] = uid;
+  }}
+
+  async function ccFetchModes(silent) {{
+    const status = document.getElementById('cc-status');
+    if (!silent && status) status.textContent = 'Fetching modes…';
+    // Ensure latest token is captured
+    const tokEl = document.getElementById('cc-token-input');
+    if (tokEl) _ccConfig.token = tokEl.value.trim();
+    // Save token+url to backend first so the proxy can use it
+    await _ccSaveToBackend(true);
+    try {{
+      const res  = await fetch('/coolercontrol/modes');
+      const data = await res.json();
+      if (data.ok && data.modes) {{
+        _ccModeList = data.modes;
+        _ccPopulateSelects();
+        document.getElementById('cc-mode-rows').style.display = '';
+        if (!silent && status) status.textContent = `${{data.modes.length}} mode(s) loaded`;
+      }} else {{
+        if (!silent && status) status.textContent = data.error || 'Failed — check token and URL';
+      }}
+    }} catch(e) {{
+      if (!silent && status) status.textContent = 'Network error';
+    }}
+  }}
+
+  function _ccPopulateSelects() {{
+    for (const key of ['default','streaming','recording','transcoding']) {{
+      const sel = document.getElementById(`cc-sel-${{key}}`);
+      if (!sel) continue;
+      const saved = _ccConfig[`mode_${{key}}`] || '';
+      sel.innerHTML = '<option value="">— none —</option>' +
+        _ccModeList.map(m =>
+          `<option value="${{m.uid}}" ${{m.uid===saved?'selected':''}}>${{m.name}}</option>`
+        ).join('');
+    }}
+  }}
+
+  async function ccActivate(key) {{
+    const uid = _ccConfig[key] || document.getElementById(`cc-sel-${{key.replace('mode_','cc-sel-')}}`)?.value;
+    if (!uid) {{ showToast('No mode selected', false); return; }}
+    const status = document.getElementById('cc-status');
+    if (status) status.textContent = `Activating ${{key.replace('mode_','')}} mode…`;
+    try {{
+      const res  = await fetch(`/coolercontrol/activate/${{uid}}`, {{method:'POST'}});
+      const data = await res.json();
+      if (data.ok) {{
+        if (status) status.textContent = '✓ Mode activated';
+        showToast('CoolerControl mode activated');
+      }} else {{
+        if (status) status.textContent = data.error || 'Activation failed';
+        showToast(data.error || 'Failed', false);
+      }}
+    }} catch(e) {{ showToast('Network error', false); }}
+  }}
+
+  async function _ccSaveToBackend(silent) {{
+    try {{
+      const res  = await fetch('/fans/cc-config', {{
+        method:  'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body:    JSON.stringify(_ccConfig),
+      }});
+      const data = await res.json();
+      return data.ok;
+    }} catch(e) {{ return false; }}
+  }}
+
+  async function ccSave() {{
+    // Read current select values into config
+    for (const key of ['default','streaming','recording','transcoding']) {{
+      const sel = document.getElementById(`cc-sel-${{key}}`);
+      if (sel) _ccConfig[`mode_${{key}}`] = sel.value;
+    }}
+    const chk = document.getElementById('cc-enabled-chk');
+    if (chk) _ccConfig.enabled = chk.checked;
+    const ok = await _ccSaveToBackend(false);
+    const status = document.getElementById('cc-status');
+    if (ok) {{
+      if (status) status.textContent = 'Saved ✓';
+      showToast('CoolerControl config saved');
+    }} else {{
+      showToast('Save failed', false);
+    }}
+  }}
+
+  // Update CC profile badge from SSE
+  function _ccUpdateBadge(profile) {{
+    const badge = document.getElementById('cc-profile-badge');
+    if (badge && profile) badge.textContent = profile;
+  }}
 </script>
 </head>
 <body>
@@ -2316,8 +3249,9 @@ def render_dashboard(
   <div class="logo">Broadcast<span>Hub</span></div>
   <div class="topbar-right">
     <div class="sse-dot" id="sse-indicator" style="opacity:.3"><div class="dot"></div> Live</div>
-    <button class="theme-toggle" id="theme-toggle" onclick="cycleTheme()">● Dark</button>
+    <button class="theme-toggle" id="theme-toggle" onclick="cycleTheme()">● Neon Ops</button>
     <a href="/mobile" class="mobile-link">Mobile ↗</a>
+    <a href="/multiview" class="mobile-link" title="Quad multiviewer">Multiview ↗</a>
     <a href="/logs" class="mobile-link" title="Real-time log viewer">Log ↗</a>
     <a href="/settings/password" class="mobile-link" title="Change password">⚙ Password</a>
     <a href="/logout" class="mobile-link" title="Sign out">Sign Out</a>
@@ -2373,6 +3307,95 @@ def render_dashboard(
     <button class="btn btn-schedule-open" onclick="openSchedule(document.getElementById('rs-input-select').value)">&#128337; Schedule</button>
   </div>
 
+  <!-- CoolerControl Integration -->
+  <div class="section-header">
+    <div class="section-lbl">&#9965; Fan Control <span id="cc-profile-badge" class="vchip" style="font-size:9px;margin-left:6px"></span></div>
+  </div>
+  <div class="gateway-card" id="cc-section">
+    <div style="flex:1">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text);white-space:nowrap">
+          <input type="checkbox" id="cc-enabled-chk" onchange="ccToggleEnabled(this.checked)">
+          CoolerControl
+        </label>
+        <input class="dl-input" id="cc-token-input" type="password"
+          placeholder="Bearer token (cc_…)" style="flex:1;min-width:180px;font-size:11px"
+          onchange="ccSetField('token',this.value)">
+        <button class="btn q-btn" style="font-size:10px;padding:5px 10px"
+          onclick="ccFetchModes()">↺ Modes</button>
+      </div>
+      <div id="cc-mode-rows" style="display:none;margin-top:10px">
+        <div style="display:grid;grid-template-columns:90px 1fr 90px 1fr;gap:6px;align-items:center;margin-bottom:6px">
+          <span style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em">Default</span>
+          <select class="dl-input" id="cc-sel-default" style="font-size:11px"
+            onchange="ccSetMode('mode_default',this.value)">
+            <option value="">— none —</option>
+          </select>
+          <span style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em">Streaming</span>
+          <select class="dl-input" id="cc-sel-streaming" style="font-size:11px"
+            onchange="ccSetMode('mode_streaming',this.value)">
+            <option value="">— none —</option>
+          </select>
+          <span style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em">Recording</span>
+          <select class="dl-input" id="cc-sel-recording" style="font-size:11px"
+            onchange="ccSetMode('mode_recording',this.value)">
+            <option value="">— none —</option>
+          </select>
+          <span style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em">Transcoding</span>
+          <select class="dl-input" id="cc-sel-transcoding" style="font-size:11px"
+            onchange="ccSetMode('mode_transcoding',this.value)">
+            <option value="">— none —</option>
+          </select>
+        </div>
+        <div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">
+          <button class="btn q-btn" style="font-size:10px;padding:4px 10px"
+            onclick="ccActivate('mode_default')">▶ Default</button>
+          <button class="btn q-btn" style="font-size:10px;padding:4px 10px"
+            onclick="ccActivate('mode_streaming')">▶ Streaming</button>
+          <button class="btn q-btn" style="font-size:10px;padding:4px 10px"
+            onclick="ccActivate('mode_recording')">▶ Recording</button>
+          <button class="btn q-btn" style="font-size:10px;padding:4px 10px"
+            onclick="ccActivate('mode_transcoding')">▶ Transcoding</button>
+          <button class="btn q-btn" style="font-size:10px;padding:4px 10px;margin-left:auto"
+            onclick="ccSave()">💾 Save</button>
+        </div>
+      </div>
+      <div id="cc-status" style="font-size:10px;color:var(--muted);margin-top:6px"></div>
+    </div>
+  </div>
+
+  <!-- System Telemetry -->
+  <div class="section-header">
+    <div class="section-lbl">&#127777; System Telemetry</div>
+  </div>
+  <div class="telemetry-card">
+    <div style="margin-bottom:8px">
+      <span style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)">Temperatures</span>
+    </div>
+    <div class="telemetry-grid" id="telemetry-temps">
+      <div class="telemetry-tile">
+        <div class="telemetry-label">CPU</div>
+        <div class="telemetry-value temp-cool" id="tel-cpu">—</div>
+        <div class="telemetry-bar-track"><div class="telemetry-bar-fill" id="tel-cpu-bar" style="width:0%;background:#4dc8a0"></div></div>
+      </div>
+      <div class="telemetry-tile">
+        <div class="telemetry-label">iGPU</div>
+        <div class="telemetry-value temp-cool" id="tel-igpu">—</div>
+        <div class="telemetry-bar-track"><div class="telemetry-bar-fill" id="tel-igpu-bar" style="width:0%;background:#4dc8a0"></div></div>
+      </div>
+      <div class="telemetry-tile">
+        <div class="telemetry-label">Arc A310</div>
+        <div class="telemetry-value temp-cool" id="tel-arc">—</div>
+        <div class="telemetry-bar-track"><div class="telemetry-bar-fill" id="tel-arc-bar" style="width:0%;background:#4dc8a0"></div></div>
+      </div>
+      <div id="tel-mw-tiles"></div>
+    </div>
+    <div style="margin-top:12px;margin-bottom:8px">
+      <span style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)">Fans</span>
+    </div>
+    <div class="telemetry-grid" id="telemetry-fans"></div>
+  </div>
+
 </div><!-- /page -->
 
 <!-- Toast -->
@@ -2401,9 +3424,14 @@ def render_dashboard(
       </div>
     </div>
     <div class="manage-list" id="manage-list"></div>
-    <div class="manage-footer">
-      <button class="btn btn-abort" onclick="closeManage()">Abort</button>
-      <button class="btn btn-commit" onclick="applyManage()">Commit</button>
+    <div class="manage-footer" style="flex-direction:column;gap:8px">
+      <button id="manage-show-hidden-btn" class="btn btn-manage"
+        style="width:100%;font-size:10px;padding:5px 11px;display:none"
+        onclick="toggleManageHidden()">▼ Show hidden</button>
+      <div style="display:flex;gap:8px;width:100%">
+        <button class="btn btn-abort" onclick="closeManage()">Abort</button>
+        <button class="btn btn-commit" onclick="applyManage()">Commit</button>
+      </div>
     </div>
   </div>
 </div>
@@ -2430,19 +3458,31 @@ def render_dashboard(
       <video id="record-video" class="modal-video" autoplay controls style="flex:1"></video>
       <div style="width:200px;flex-shrink:0">
         <div class="adb-panel">
-          <input id="adb-ip-field" type="text" class="adb-ip-input" placeholder="ADB IP:5555">
-          <button class="adb-save-btn" onclick="saveAdbIp(_activeAdbInputId)">Link TV</button>
-          <div class="adb-remote">
-            <button class="adb-btn adb-dpad" onclick="adbKey('up')">▲</button>
+          <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px">
+            <select id="remote-type-sel" class="dl-input" style="flex:1;font-size:11px"
+              onchange="onRemoteTypeChange()">
+              <option value="none">No Remote</option>
+              <option value="adb">ADB (Android TV)</option>
+              <option value="roku">Roku (ECP)</option>
+            </select>
+          </div>
+          <div id="remote-ip-row" style="display:none;margin-bottom:6px">
+            <input id="adb-ip-field" type="text" class="adb-ip-input"
+              placeholder="Device IP" style="width:100%;box-sizing:border-box">
+            <button class="adb-save-btn" style="margin-top:4px;width:100%"
+              onclick="saveRemote(_activeAdbInputId)">Link Device</button>
+          </div>
+          <div class="adb-remote" id="remote-buttons" style="display:none">
+            <button class="adb-btn adb-dpad" onclick="remoteKey('up')">▲</button>
             <div class="adb-row">
-              <button class="adb-btn adb-dpad" onclick="adbKey('left')">◀</button>
-              <button class="adb-btn adb-dpad adb-center" onclick="adbKey('enter')">OK</button>
-              <button class="adb-btn adb-dpad" onclick="adbKey('right')">▶</button>
+              <button class="adb-btn adb-dpad" onclick="remoteKey('left')">◀</button>
+              <button class="adb-btn adb-dpad adb-center" onclick="remoteKey('enter')">OK</button>
+              <button class="adb-btn adb-dpad" onclick="remoteKey('right')">▶</button>
             </div>
-            <button class="adb-btn adb-dpad" onclick="adbKey('down')">▼</button>
+            <button class="adb-btn adb-dpad" onclick="remoteKey('down')">▼</button>
             <div class="adb-row" style="margin-top:8px">
-              <button class="adb-btn adb-action adb-home" onclick="adbKey('home')">Home</button>
-              <button class="adb-btn adb-action adb-back" onclick="adbKey('back')">Back</button>
+              <button class="adb-btn adb-action adb-home" onclick="remoteKey('home')">Home</button>
+              <button class="adb-btn adb-action adb-back" onclick="remoteKey('back')">Back</button>
             </div>
           </div>
           <div id="adb-status" class="adb-status"></div>
@@ -2468,7 +3508,7 @@ def render_dashboard(
       <input type="hidden" name="duration" id="rec-dur-hidden" value="1800">
       <label class="adb-home-row span2" id="rec-adb-home-row">
         <input type="checkbox" name="adb_home" id="rec-adb-home" value="1">
-        <span>Return TV to Home screen 60s after recording ends</span>
+        <span>Return device to Home screen 60s after recording ends</span>
       </label>
       <button type="button" class="btn-engage span2" onclick="submitRecordForm()">Engage Capture</button>
     </form>
