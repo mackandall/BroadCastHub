@@ -172,7 +172,9 @@ Decklink cards are supported via ffmpeg's decklink input device. No additional b
 
 ---
 
-## Acknowledgements
+## Contributors
+
+See [CONTRIBUTORS.md](CONTRIBUTORS.md).
 
 Built with assistance from [Claude](https://claude.ai) (Anthropic) — AI pair programmer for architecture, implementation, and debugging.
 Conceptualized initially by @istwok on Chanels DVR forums. 
