@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+
+# runtime secrets / device config — not for source control
+auth.json
+channels.json
+fan_config.json
+input_config.json
+provider_settings.json
+stream_settings.json
+upnp_uuid.txt
+
+# large local artifact
+raw-audio.bin
+
+# old backup copy
+vlc version/

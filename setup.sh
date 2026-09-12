@@ -105,6 +105,47 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 2b. Fan PWM sudoers rule
+# ---------------------------------------------------------------------------
+hdr "Step 2b — Passwordless sudo for fan PWM control"
+
+FAN_SUDOERS_FILE="/etc/sudoers.d/broadcast-hub-fan"
+TEE_BIN=$(which tee)
+
+echo ""
+echo "Broadcast Hub can control a PWM fan channel to ramp up when a hot"
+echo "capture input is streaming. This requires passwordless write access"
+echo "to the sysfs hwmon PWM node."
+echo ""
+echo "Example: /sys/class/hwmon/hwmon2/pwm6"
+echo "Leave blank to skip fan control setup."
+echo ""
+read -rp "PWM sysfs path (or blank to skip): " FAN_PWM_PATH
+
+if [[ -n "$FAN_PWM_PATH" ]]; then
+    # Basic sanity check — must be under /sys/class/hwmon/
+    if [[ ! "$FAN_PWM_PATH" =~ ^/sys/class/hwmon/hwmon[0-9]+/pwm[0-9]+$ ]]; then
+        err "Path must match /sys/class/hwmon/hwmonN/pwmN — skipping."
+    elif [[ ! -f "$FAN_PWM_PATH" ]]; then
+        err "Path does not exist: $FAN_PWM_PATH — skipping."
+    else
+        FAN_RULE="$REAL_USER ALL=(root) NOPASSWD: $TEE_BIN $FAN_PWM_PATH"
+        if echo "$FAN_RULE" | visudo -cf - 2>/dev/null; then
+            echo "$FAN_RULE" > "$FAN_SUDOERS_FILE"
+            chmod 0440 "$FAN_SUDOERS_FILE"
+            ok "Fan sudoers rule written: $FAN_SUDOERS_FILE"
+            ok "  → $REAL_USER can write to $FAN_PWM_PATH without a password"
+        else
+            err "visudo validation failed — fan sudoers rule NOT written."
+            warn "Add manually: sudo visudo -f $FAN_SUDOERS_FILE"
+            warn "  $FAN_RULE"
+        fi
+    fi
+else
+    echo "Skipping fan PWM setup."
+fi
+
+# ---------------------------------------------------------------------------
 # 3. Save installer path to input_config.json
 # ---------------------------------------------------------------------------
 hdr "Step 3 — Saving config"
