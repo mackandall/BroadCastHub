@@ -923,6 +923,859 @@ def render_multiview(all_ids: list, live_ids: list, cfg: dict) -> str:
 #   should_be_live    : snapshot of SHOULD_BE_LIVE dict  (for fault/restart badges)
 #   format_ext        : FORMAT_EXT constant dict
 
+def render_channels(all_ids: list, cfg: dict) -> str:
+    """Render the standalone Channels page: tuner/device mapping (which
+    ADB/Roku remote IP is plugged into which physical input) plus the
+    channel list, add/edit/delete, Test Tune, and Release actions.
+
+    Split out from the main dashboard because channel management is
+    occasional configuration work, not something that needs to compete
+    for space with the live-monitoring panels (fan control, telemetry,
+    recording) on every page load.
+
+    Parameters:
+      all_ids : ordered list of all configured input key strings
+      cfg     : snapshot of input_config dict (for remote_type/remote_ip)
+    """
+    device_rows_html = "\n".join(
+        f"""
+        <div class="device-row" data-input-id="{iid}">
+          <span class="device-row-label">{_label(iid)}</span>
+          <select class="dl-input device-remote-type" style="width:120px" onchange="onDeviceRemoteTypeChange('{iid}')">
+            <option value="none" {"selected" if cfg.get(iid, {}).get("remote_type", "none") == "none" else ""}>No Remote</option>
+            <option value="adb"  {"selected" if cfg.get(iid, {}).get("remote_type") == "adb"  else ""}>ADB (Android TV)</option>
+            <option value="roku" {"selected" if cfg.get(iid, {}).get("remote_type") == "roku" else ""}>Roku (ECP)</option>
+          </select>
+          <input class="dl-input device-remote-ip" type="text" style="flex:1"
+            placeholder="Device IP (e.g. 192.168.1.130)"
+            value="{cfg.get(iid, {}).get('remote_ip', '')}"
+            {"disabled" if cfg.get(iid, {}).get("remote_type", "none") == "none" else ""}>
+          <button class="btn q-btn" style="font-size:10px;padding:5px 10px" onclick="saveDeviceRemote('{iid}')">Save</button>
+          <span class="device-row-status" id="device-status-{iid}"></span>
+        </div>"""
+        for iid in all_ids
+    )
+
+    return f"""<!DOCTYPE html>
+<html data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Channels — Broadcast Hub</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap" rel="stylesheet">
+<script>
+  (function(){{
+    try {{
+      var t = localStorage.getItem('bh-theme');
+      if (t && ['dark','mono','light'].includes(t))
+        document.documentElement.setAttribute('data-theme', t);
+    }} catch(e) {{}}
+  }})();
+</script>
+<style>
+  *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+
+  :root, [data-theme="dark"] {{
+    --bg:          #090d1a;
+    --bg-topbar:   rgba(9,13,26,.97);
+    --surface:     #0b0f22;
+    --border:      #1c2540;
+    --border-hi:   #2a3560;
+    --text:        #c0cce8;
+    --muted:       #3a4870;
+    --dim:         #1c2540;
+    --accent:      #00e5ff;
+    --accent-dim:  rgba(0,229,255,.15);
+    --accent-bdr:  rgba(0,229,255,.35);
+    --live:        #ff0066;
+    --purple:      #b464ff;
+    --green:       #4dc8a0;
+  }}
+  [data-theme="mono"] {{
+    --bg:          #100e06;
+    --bg-topbar:   rgba(12,10,4,.98);
+    --surface:     #0c0a04;
+    --border:      #2a1e08;
+    --border-hi:   #3a2810;
+    --text:        #e8d0a0;
+    --muted:       #5a3818;
+    --dim:         #2a1e08;
+    --accent:      #ff6600;
+    --accent-dim:  rgba(255,102,0,.15);
+    --accent-bdr:  rgba(255,102,0,.4);
+    --live:        #ff2200;
+    --purple:      #d896ff;
+    --green:       #88cc00;
+  }}
+  [data-theme="light"] {{
+    --bg:          #f3f5fa;
+    --bg-topbar:   rgba(26,31,56,.98);
+    --surface:     #fff;
+    --border:      #c8cedd;
+    --border-hi:   #b0b8d0;
+    --text:        #1a1f38;
+    --muted:       #6878a8;
+    --dim:         #e4e8f4;
+    --accent:      #4d9fff;
+    --accent-dim:  rgba(77,159,255,.12);
+    --accent-bdr:  rgba(77,159,255,.4);
+    --live:        #dc2626;
+    --purple:      #8a5fd6;
+    --green:       #059669;
+  }}
+
+  body {{
+    background: var(--bg); color: var(--text);
+    font-family: 'Inter', sans-serif;
+  }}
+
+  .topbar {{
+    padding: 11px 18px; border-bottom: 1px solid var(--border);
+    background: var(--bg-topbar); backdrop-filter: blur(14px);
+    display: flex; align-items: center; gap: 12px;
+    position: sticky; top: 0; z-index: 50;
+  }}
+  .logo {{ font-weight: 900; font-style: italic; font-size: 16px;
+           text-transform: uppercase; color: var(--text); text-decoration: none; }}
+  .logo span {{ color: var(--accent); }}
+  .page-title {{ font-size: 10px; font-weight: 700; text-transform: uppercase;
+                 letter-spacing: .14em; color: var(--muted); }}
+  .spacer {{ flex: 1; }}
+  .nav-link {{
+    font-size: 10px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: .08em; color: var(--muted); text-decoration: none;
+    padding: 5px 10px; border-radius: 4px; border: 1px solid var(--border);
+    transition: color .15s;
+  }}
+  .nav-link:hover {{ color: var(--text); }}
+  .nav-link.active {{ color: var(--accent); background: var(--accent-dim); border-color: var(--accent-bdr); }}
+
+  .btn {{
+    font-family: 'Inter', sans-serif; font-weight: 900; font-size: 11px;
+    text-transform: uppercase; letter-spacing: .07em;
+    padding: 8px 14px; border-radius: 4px; border: none;
+    cursor: pointer; transition: opacity .15s, background .15s;
+    white-space: nowrap; text-decoration: none;
+    display: inline-flex; align-items: center; justify-content: center;
+  }}
+  .btn:active {{ opacity: .7; }}
+  .q-btn {{
+    font-family: 'Inter', sans-serif; font-weight: 900; font-size: 9px;
+    text-transform: uppercase; letter-spacing: .1em;
+    background: var(--accent-dim); border: 1px solid var(--accent-bdr);
+    color: var(--accent); padding: 4px 9px; border-radius: 4px;
+    cursor: pointer; transition: background .15s; white-space: nowrap;
+  }}
+  .q-btn:hover {{ background: rgba(0,229,255,.22); }}
+
+  .overlay {{
+    display: none; position: fixed; inset: 0;
+    background: rgba(0,0,0,.82); backdrop-filter: blur(6px);
+    z-index: 999; align-items: center; justify-content: center;
+  }}
+  .overlay.show {{ display: flex !important; }}
+  .modal {{
+    background: var(--surface); border: 1px solid var(--border-hi);
+    border-radius: 4px; padding: 24px 28px;
+    max-width: 95vw; max-height: 95vh; overflow-y: auto;
+  }}
+  .modal-hdr {{
+    display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px;
+  }}
+  .modal-title {{ font-weight: 900; font-size: 15px; text-transform: uppercase; letter-spacing: .06em; color: var(--text); }}
+  .modal-close {{ background: none; border: none; color: var(--muted); font-size: 24px; cursor: pointer; padding: 0; line-height: 1; }}
+  .modal-close:hover {{ color: var(--text); }}
+
+  .dl-grid {{
+    display: grid; grid-template-columns: 90px 1fr; gap: 8px 10px; align-items: center;
+  }}
+  .dl-lbl {{
+    font-size: 9px; font-weight: 900; text-transform: uppercase;
+    letter-spacing: .1em; color: var(--muted); text-align: right;
+  }}
+  .dl-input {{
+    background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    font-family: 'Inter', sans-serif; font-size: 12px; padding: 6px 9px;
+    border-radius: 4px; outline: none; width: 100%;
+  }}
+  .dl-input:focus {{ border-color: var(--accent); }}
+  .dl-input:disabled {{ opacity: .4; }}
+
+  .page-wrap {{ max-width: 920px; margin: 0 auto; padding: 20px 16px 60px; }}
+  .section-header {{ margin: 28px 0 10px; }}
+  .section-lbl {{
+    font-size: 11px; font-weight: 900; text-transform: uppercase;
+    letter-spacing: .1em; color: var(--muted);
+  }}
+  .card {{
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 6px; padding: 14px 16px;
+  }}
+  .device-row {{
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 0; border-bottom: 1px solid var(--border);
+  }}
+  .device-row:last-child {{ border-bottom: none; }}
+  .device-row-label {{
+    width: 110px; flex-shrink: 0; font-size: 12px; color: var(--text);
+    font-family: 'Courier New', monospace;
+  }}
+  .device-row-status {{ font-size: 10px; color: var(--muted); min-width: 60px; text-align: right; }}
+  .channel-row {{
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 10px; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 4px; margin-bottom: 6px;
+  }}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <a href="/" class="logo">Broadcast<span>Hub</span></a>
+  <span class="page-title">/ Channels</span>
+  <div class="spacer"></div>
+  <a href="/" class="nav-link">Dashboard</a>
+  <a href="/mobile" class="nav-link">Mobile ↗</a>
+  <a href="/multiview" class="nav-link">Multiview</a>
+  <a href="/channels" class="nav-link active">Channels</a>
+  <a href="/logs" class="nav-link">Log ↗</a>
+</div>
+
+<div class="page-wrap">
+
+  <div class="section-header"><div class="section-lbl">&#128246; Tuner Devices</div></div>
+  <div class="card">
+    <div style="font-size:11px;color:var(--muted);margin-bottom:10px">
+      Link each physical input to the IP address of the Android/Roku device plugged into it.
+      This is the same tuner pool the Channels section below auto-selects from when tuning —
+      any input with a remote configured here is available as a tuner.
+    </div>
+    <div id="device-rows-container">
+      {device_rows_html}
+    </div>
+  </div>
+
+  <div class="section-header"><div class="section-lbl">&#9881; Provider Timing Settings</div></div>
+  <div class="card">
+    <div style="font-size:11px;color:var(--muted);margin-bottom:10px">
+      These three timing values are safe to adjust and won't break tuning if set wrong —
+      just make it faster/slower or less/more tolerant. Everything else about how a
+      provider is tuned (deep-link format, app package, keycodes) is fixed in code,
+      since those have to match the app exactly or tuning silently fails.
+    </div>
+    <div id="provider-settings-container"></div>
+  </div>
+
+  <div class="section-header"><div class="section-lbl">&#9881; Streaming Behavior</div></div>
+  <div class="card">
+    <div style="display:flex;align-items:flex-start;gap:12px">
+      <input type="checkbox" id="same-client-eviction-toggle" style="margin-top:3px"
+        onchange="saveStreamSettings()">
+      <div>
+        <label for="same-client-eviction-toggle" style="font-size:12px;font-weight:700;cursor:pointer">
+          Stop old channel when the same client switches
+        </label>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px">
+          On: correct for a single viewer browsing channels in a player like VLC —
+          the previous channel is stopped the moment a new one is requested, instead of
+          waiting up to 30-40 seconds to be noticed as abandoned.<br>
+          Off: required if you use a DVR that records multiple channels at once
+          (e.g. Channels DVR) — every recording comes from the same server, and with
+          this on, starting a new one would incorrectly stop every other recording
+          already in progress.
+        </div>
+      </div>
+    </div>
+    <div style="display:flex;align-items:flex-start;gap:12px;margin-top:16px">
+      <input type="checkbox" id="edid-refresh-toggle" style="margin-top:3px"
+        onchange="saveStreamSettings()">
+      <div>
+        <label for="edid-refresh-toggle" style="font-size:12px;font-weight:700;cursor:pointer">
+          Refresh EDID on every tune
+        </label>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px">
+          Re-writes the input's configured EDID right before every tune, forcing the
+          connected device to re-negotiate its HDMI output. Confirmed via a live test to
+          fix distorted/garbled audio — a manual EDID reload while watching a corrupted
+          stream caused the video to visibly resync and the audio to come out clean.<br>
+          Adds a small delay to every tune (typically under a second). Turn off to
+          isolate it during testing, or if a particular setup doesn't need it.
+        </div>
+      </div>
+    </div>
+    <div style="display:flex;align-items:flex-start;gap:12px;margin-top:16px">
+      <input type="checkbox" id="stray-sleep-toggle" style="margin-top:3px"
+        onchange="saveStreamSettings()">
+      <div>
+        <label for="stray-sleep-toggle" style="font-size:12px;font-weight:700;cursor:pointer">
+          Sleep devices that wake up on their own
+        </label>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px">
+          Every device-sleep mechanism in this app is reactive — scoped to devices we
+          ourselves tuned. A box that reboots on its own (e.g. a firmware update) and
+          wakes up showing whatever channel it defaults to is otherwise completely
+          invisible to us and would stay awake indefinitely, with no client ever having
+          asked for it. This checks every tuner-pool device on the interval below and
+          puts it back to sleep if it's awake with no tune of ours behind it.
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;margin-top:8px">
+          <label for="stray-sweep-interval" style="font-size:11px;color:var(--muted)">
+            Check every
+          </label>
+          <input type="number" id="stray-sweep-interval" min="15" step="5" value="60"
+            style="width:70px;font-size:11px;padding:3px 6px"
+            onchange="saveStreamSettings()">
+          <span style="font-size:11px;color:var(--muted)">seconds (minimum 15)</span>
+        </div>
+      </div>
+    </div>
+    <div id="stream-settings-status" style="font-size:10px;color:var(--muted);margin-top:8px"></div>
+  </div>
+
+  <div class="section-header">
+    <div class="section-lbl">&#128225; Channels <span id="tuner-pool-info" style="font-weight:400;text-transform:none;letter-spacing:0;margin-left:8px"></span></div>
+  </div>
+  <div class="card">
+    <div id="channels-list-container" style="display:flex;flex-direction:column;gap:6px"></div>
+    <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+      <button class="btn q-btn" style="font-size:10px;padding:5px 12px"
+        onclick="openChannelEditor(null)">+ Add Channel</button>
+      <button class="btn q-btn" style="font-size:10px;padding:5px 12px"
+        onclick="openM3uImport()">&#8593; Import M3U</button>
+      <button class="btn q-btn" style="font-size:10px;padding:5px 12px"
+        onclick="openRawM3uEditor()">&#128196; View / Edit Raw M3U</button>
+      <button class="btn q-btn" style="font-size:10px;padding:5px 12px;color:var(--live);border-color:var(--live)"
+        onclick="clearAllChannels()">&#128465; Clear All</button>
+      <button class="btn q-btn" style="font-size:10px;padding:5px 12px;margin-left:auto"
+        onclick="copyExportUrl()">&#8595; Copy Export URL</button>
+    </div>
+    <div id="export-url-status" style="font-size:10px;color:var(--muted);margin-top:6px"></div>
+  </div>
+
+</div>
+
+<!-- Raw M3U view/edit modal -->
+<div class="overlay" id="raw-m3u-overlay">
+  <div class="modal" style="width:640px">
+    <div class="modal-hdr">
+      <div class="modal-title">Raw M3U</div>
+      <button class="modal-close" onclick="closeRawM3uEditor()">&times;</button>
+    </div>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:10px">
+      This is the M3U currently being served at the Export URL, generated from your
+      configured channels (disabled channels are left out). Edit it directly and use
+      one of the two buttons below, or just use it as a reference.
+    </div>
+    <textarea id="raw-m3u-text" rows="16" class="dl-input"
+      style="font-family:'Courier New',monospace;font-size:11px;width:100%;resize:vertical"></textarea>
+    <div id="raw-m3u-status" style="font-size:11px;color:var(--muted);margin-top:8px;min-height:14px"></div>
+    <div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end;flex-wrap:wrap">
+      <button class="btn q-btn" onclick="closeRawM3uEditor()">Close</button>
+      <button class="btn q-btn" onclick="submitRawM3uUpdate(false)">Update From This Text</button>
+      <button class="btn q-btn" style="color:var(--live);border-color:var(--live)"
+        onclick="submitRawM3uUpdate(true)">Replace All From This Text</button>
+    </div>
+  </div>
+</div>
+
+<!-- M3U import modal -->
+<div class="overlay" id="m3u-import-overlay">
+  <div class="modal" style="width:600px">
+    <div class="modal-hdr">
+      <div class="modal-title">Import M3U</div>
+      <button class="modal-close" onclick="closeM3uImport()">&times;</button>
+    </div>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:10px">
+      Paste an ah4c-style M3U playlist below. Existing channels with matching
+      IDs are updated; everything else is added. Nothing is removed.
+    </div>
+    <textarea id="m3u-import-text" rows="12" class="dl-input"
+      style="font-family:'Courier New',monospace;font-size:11px;width:100%;resize:vertical"
+      placeholder="#EXTM3U&#10;#EXTINF:-1 channel-number=&quot;77&quot;,MeTV&#10;http://.../play/tuner/METV~83321f4e-..."></textarea>
+    <div class="dl-grid" style="margin-top:10px">
+      <label class="dl-lbl">Provider</label>
+      <select class="dl-input" id="m3u-import-provider"></select>
+    </div>
+    <div id="m3u-import-status" style="font-size:11px;color:var(--muted);margin-top:8px;min-height:14px"></div>
+    <div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">
+      <button class="btn q-btn" onclick="closeM3uImport()">Cancel</button>
+      <button class="btn q-btn" onclick="submitM3uImport()">Import</button>
+    </div>
+  </div>
+</div>
+
+<!-- Channel editor modal -->
+<div class="overlay" id="channel-editor-overlay">
+  <div class="modal" style="width:480px">
+    <div class="modal-hdr">
+      <div class="modal-title" id="channel-editor-title">Add Channel</div>
+      <button class="modal-close" onclick="closeChannelEditor()">&times;</button>
+    </div>
+    <input type="hidden" id="ce-orig-id" value="">
+    <div class="dl-grid">
+      <label class="dl-lbl">Channel ID</label>
+      <input class="dl-input" id="ce-channel-id" type="text" placeholder="TNTHD~acf51074-...">
+      <label class="dl-lbl">Display Name</label>
+      <input class="dl-input" id="ce-display-name" type="text" placeholder="TNT HD">
+      <label class="dl-lbl">Guide Number</label>
+      <input class="dl-input" id="ce-guide-number" type="text" placeholder="13.1">
+      <label class="dl-lbl">Provider</label>
+      <select class="dl-input" id="ce-provider"></select>
+      <label class="dl-lbl">Call Sign</label>
+      <input class="dl-input" id="ce-callsign" type="text" placeholder="TNTHD">
+      <label class="dl-lbl">Content ID</label>
+      <input class="dl-input" id="ce-content-id" type="text" placeholder="acf51074-6940-81d8-2355-c2eb610e0afc">
+      <label class="dl-lbl">Settle Time (s)</label>
+      <input class="dl-input" id="ce-settle-time" type="number" min="5" max="120" value="20">
+    </div>
+    <div id="ce-status" style="font-size:11px;color:var(--muted);margin-top:8px;min-height:14px"></div>
+    <div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">
+      <button class="btn q-btn" onclick="closeChannelEditor()">Cancel</button>
+      <button class="btn q-btn" onclick="saveChannelEditor()">Save</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  function showToast(msg, ok=true) {{
+    let t = document.getElementById('_toast');
+    if (!t) {{
+      t = document.createElement('div');
+      t.id = '_toast';
+      t.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);' +
+        'padding:10px 18px;border-radius:6px;font-size:12px;z-index:9999;transition:opacity .3s;color:#fff';
+      document.body.appendChild(t);
+    }}
+    t.style.background = ok ? '#1a7a4c' : '#a83232';
+    t.textContent = msg;
+    t.style.opacity = '1';
+    clearTimeout(t._hideTimer);
+    t._hideTimer = setTimeout(() => {{ t.style.opacity = '0'; }}, 3500);
+  }}
+
+  // ── Tuner device mapping ─────────────────────────────────────────────────────
+
+  function onDeviceRemoteTypeChange(inputId) {{
+    const row = document.querySelector(`.device-row[data-input-id="${{inputId}}"]`);
+    const type = row.querySelector('.device-remote-type').value;
+    row.querySelector('.device-remote-ip').disabled = (type === 'none');
+  }}
+
+  async function saveDeviceRemote(inputId) {{
+    const row = document.querySelector(`.device-row[data-input-id="${{inputId}}"]`);
+    const remoteType = row.querySelector('.device-remote-type').value;
+    const remoteIp   = row.querySelector('.device-remote-ip').value.trim();
+    const status     = document.getElementById(`device-status-${{inputId}}`);
+    const fd = new FormData();
+    fd.append('remote_type', remoteType);
+    fd.append('remote_ip', remoteIp);
+    try {{
+      const res  = await fetch(`/input/${{encodeURIComponent(inputId)}}/set_remote`, {{method: 'POST', body: fd}});
+      const data = await res.json();
+      if (data.ok) {{
+        if (status) status.textContent = 'Saved ✓';
+        showToast(`${{inputId}} remote saved`);
+        refreshChannelsList();
+      }} else {{
+        if (status) status.textContent = data.error || 'Failed';
+        showToast(data.error || 'Save failed', false);
+      }}
+    }} catch(e) {{ showToast('Network error', false); }}
+  }}
+
+  // ── Provider timing settings ─────────────────────────────────────────────────
+
+  const PROVIDER_FIELD_LABELS = {{
+    settle_after_ready_secs:  {{ label: 'Settle Delay (s)',       hint: 'Pause after the app reports playing, before capture starts. Covers any residual loading transition.' }},
+    readiness_timeout_secs:   {{ label: 'Readiness Timeout (s)',  hint: "How long to wait for the app to report it is playing before giving up and trying the next tuner." }},
+    heartbeat_interval_secs:  {{ label: 'Heartbeat Interval (s)', hint: "How often a keepalive is sent during playback. Keep below the app's own inactivity timeout (DirecTV: 5 min / 300s)." }},
+  }};
+
+  async function loadProviderSettings() {{
+    const container = document.getElementById('provider-settings-container');
+    if (!container) return;
+    try {{
+      const res  = await fetch('/channels/provider_settings');
+      const data = await res.json();
+      if (!data.ok) return;
+      const ranges = data.field_ranges;
+      container.innerHTML = Object.entries(data.providers).map(([key, p]) => {{
+        const fields = Object.entries(p.values).map(([field, val]) => {{
+          const meta  = PROVIDER_FIELD_LABELS[field] || {{ label: field, hint: '' }};
+          const range = ranges[field] || {{}};
+          return `
+          <div style="display:grid;grid-template-columns:140px 1fr;gap:8px;align-items:start;margin-bottom:8px">
+            <label class="dl-lbl" style="text-align:left;padding-top:6px" title="${{meta.hint}}">${{meta.label}}</label>
+            <div>
+              <input class="dl-input provider-field-input" type="number"
+                data-provider="${{key}}" data-field="${{field}}"
+                min="${{range.min}}" max="${{range.max}}" step="${{range.step}}" value="${{val}}"
+                style="width:120px">
+              <div style="font-size:10px;color:var(--muted);margin-top:3px">${{meta.hint}}</div>
+            </div>
+          </div>`;
+        }}).join('');
+        return `
+        <div style="margin-bottom:10px;border-bottom:1px solid var(--border)">
+          <div style="display:flex;align-items:center;gap:8px;padding-bottom:10px;cursor:pointer"
+            onclick="toggleProviderCard('${{key}}')">
+            <span id="provider-chevron-${{key}}" style="font-size:10px;color:var(--muted);transition:transform .15s;display:inline-block">&#9656;</span>
+            <span style="font-size:12px;font-weight:700">${{p.label}}</span>
+          </div>
+          <div id="provider-body-${{key}}" style="display:none;padding-bottom:14px">
+            ${{fields}}
+            <button class="btn q-btn" style="font-size:10px;padding:5px 12px" onclick="saveProviderSettings('${{key}}')">Save</button>
+            <span id="provider-status-${{key}}" style="font-size:10px;color:var(--muted);margin-left:8px"></span>
+          </div>
+        </div>`;
+      }}).join('');
+    }} catch(e) {{}}
+  }}
+
+  function toggleProviderCard(providerKey) {{
+    const body    = document.getElementById(`provider-body-${{providerKey}}`);
+    const chevron = document.getElementById(`provider-chevron-${{providerKey}}`);
+    if (!body) return;
+    const isOpen = body.style.display !== 'none';
+    body.style.display = isOpen ? 'none' : 'block';
+    if (chevron) chevron.style.transform = isOpen ? 'rotate(0deg)' : 'rotate(90deg)';
+  }}
+
+  async function saveProviderSettings(providerKey) {{
+    const inputs = document.querySelectorAll(`.provider-field-input[data-provider="${{providerKey}}"]`);
+    const status = document.getElementById(`provider-status-${{providerKey}}`);
+    const fd = new FormData();
+    inputs.forEach(inp => fd.append(inp.dataset.field, inp.value));
+    try {{
+      const res  = await fetch(`/channels/provider_settings/${{encodeURIComponent(providerKey)}}`, {{method: 'POST', body: fd}});
+      const data = await res.json();
+      if (data.ok) {{
+        if (status) status.textContent = 'Saved ✓';
+        showToast(`${{providerKey}} settings saved`);
+        loadProviderSettings();
+      }} else {{
+        if (status) status.textContent = data.error || 'Failed';
+        showToast(data.error || 'Save failed', false);
+      }}
+    }} catch(e) {{ showToast('Network error', false); }}
+  }}
+
+  async function loadStreamSettings() {{
+    try {{
+      const res  = await fetch('/channels/stream_settings');
+      const data = await res.json();
+      if (data.ok) {{
+        const evictionBox = document.getElementById('same-client-eviction-toggle');
+        if (evictionBox) evictionBox.checked = data.same_client_eviction;
+        const edidBox = document.getElementById('edid-refresh-toggle');
+        if (edidBox) edidBox.checked = data.edid_refresh_on_tune;
+        const strayBox = document.getElementById('stray-sleep-toggle');
+        if (strayBox) strayBox.checked = data.stray_device_sleep;
+        const intervalInput = document.getElementById('stray-sweep-interval');
+        if (intervalInput) intervalInput.value = data.stray_device_sweep_interval_secs;
+      }}
+    }} catch(e) {{}}
+  }}
+
+  async function saveStreamSettings() {{
+    const status = document.getElementById('stream-settings-status');
+    const evictionBox = document.getElementById('same-client-eviction-toggle');
+    const edidBox = document.getElementById('edid-refresh-toggle');
+    const strayBox = document.getElementById('stray-sleep-toggle');
+    const intervalInput = document.getElementById('stray-sweep-interval');
+    const fd = new FormData();
+    fd.append('same_client_eviction', evictionBox.checked ? 'true' : 'false');
+    fd.append('edid_refresh_on_tune', edidBox.checked ? 'true' : 'false');
+    fd.append('stray_device_sleep', strayBox.checked ? 'true' : 'false');
+    fd.append('stray_device_sweep_interval_secs', intervalInput.value || '60');
+    try {{
+      const res  = await fetch('/channels/stream_settings', {{method: 'POST', body: fd}});
+      const data = await res.json();
+      if (data.ok) {{
+        if (intervalInput) intervalInput.value = data.stray_device_sweep_interval_secs;
+        if (status) status.textContent = 'Saved ✓';
+        showToast('Streaming behavior settings saved');
+      }} else {{
+        if (status) status.textContent = 'Save failed';
+        showToast('Save failed', false);
+      }}
+    }} catch(e) {{ showToast('Network error', false); }}
+  }}
+
+  // ── Channels ──────────────────────────────────────────────────────────────────
+
+  let _channelProviders = [];
+
+  async function _loadChannelProviders() {{
+    if (_channelProviders.length) return;
+    try {{
+      const res  = await fetch('/channels/providers');
+      const data = await res.json();
+      if (data.ok) {{
+        _channelProviders = data.providers;
+        const sel = document.getElementById('ce-provider');
+        if (sel) {{
+          sel.innerHTML = _channelProviders.map(p =>
+            `<option value="${{p.key}}">${{p.label}}</option>`
+          ).join('');
+        }}
+      }}
+    }} catch(e) {{}}
+  }}
+
+  async function refreshChannelsList() {{
+    const container = document.getElementById('channels-list-container');
+    if (!container) return;
+    try {{
+      const res  = await fetch('/channels/list');
+      const data = await res.json();
+      if (!data.ok) return;
+      if (data.channels.length === 0) {{
+        container.innerHTML = `<div style="font-size:11px;color:var(--muted)">No channels configured yet.</div>`;
+      }} else {{
+        container.innerHTML = data.channels.map(ch => {{
+          const isEnabled = ch.enabled !== false;
+          const tunedBadge = ch.currently_tuned
+            ? `<span style="color:#4dc8a0;font-size:9px;font-weight:700">\u25cf TUNED: ${{ch.tuned_input_id}}</span>`
+            : `<span style="font-size:10px;color:var(--muted)">idle</span>`;
+          const stopBtn = ch.currently_tuned
+            ? `<button class="btn q-btn" style="font-size:9px;padding:3px 8px" onclick="releaseTuner('${{ch.tuned_input_id}}')">\u25a0 Stop</button>`
+            : '';
+          const toggleLabel = isEnabled ? 'Disable' : 'Enable';
+          const toggleStyle = isEnabled
+            ? 'font-size:9px;padding:3px 8px'
+            : 'font-size:9px;padding:3px 8px;color:#4dc8a0;border-color:#4dc8a0';
+          const rowStyle = isEnabled ? '' : 'opacity:.45';
+          return `
+          <div class="channel-row" style="${{rowStyle}}">
+            <span style="font-family:'Courier New',monospace;font-size:11px;color:var(--muted);width:44px;flex-shrink:0">${{ch.guide_number||'\u2014'}}</span>
+            <span style="flex:1;font-size:12px">${{ch.display_name}}</span>
+            ${{isEnabled ? tunedBadge : '<span style="font-size:10px;color:var(--muted)">disabled</span>'}}
+            <button class="btn q-btn" style="${{toggleStyle}}" onclick="toggleChannel('${{ch.channel_id}}')">${{toggleLabel}}</button>
+            <button class="btn q-btn" style="font-size:9px;padding:3px 8px" onclick="testTuneChannel('${{ch.channel_id}}')" ${{isEnabled ? '' : 'disabled'}}>\u25b6 Test</button>
+            ${{stopBtn}}
+            <button class="btn q-btn" style="font-size:9px;padding:3px 8px" onclick='openChannelEditor(${{JSON.stringify(ch)}})'>Edit</button>
+            <button class="btn q-btn" style="font-size:9px;padding:3px 8px" onclick="deleteChannel('${{ch.channel_id}}')">Delete</button>
+          </div>`;
+        }}).join('');
+      }}
+      const poolInfo = document.getElementById('tuner-pool-info');
+      if (poolInfo) poolInfo.textContent = `Tuner pool: ${{data.tuner_pool_size - data.tuner_pool_busy}}/${{data.tuner_pool_size}} free`;
+    }} catch(e) {{}}
+  }}
+
+  async function openChannelEditor(ch) {{
+    await _loadChannelProviders();
+    document.getElementById('channel-editor-title').textContent = ch ? 'Edit Channel' : 'Add Channel';
+    document.getElementById('ce-orig-id').value       = ch ? ch.channel_id : '';
+    document.getElementById('ce-channel-id').value    = ch ? ch.channel_id : '';
+    document.getElementById('ce-channel-id').disabled = !!ch;
+    document.getElementById('ce-display-name').value  = ch ? ch.display_name : '';
+    document.getElementById('ce-guide-number').value  = ch ? ch.guide_number : '';
+    document.getElementById('ce-provider').value      = ch ? ch.provider : '';
+    document.getElementById('ce-callsign').value      = ch ? ch.callsign : '';
+    document.getElementById('ce-content-id').value    = ch ? ch.content_id : '';
+    document.getElementById('ce-settle-time').value   = ch ? ch.settle_time_secs : 20;
+    document.getElementById('ce-status').textContent  = '';
+    document.getElementById('channel-editor-overlay').classList.add('show');
+  }}
+
+  function closeChannelEditor() {{
+    document.getElementById('channel-editor-overlay').classList.remove('show');
+  }}
+
+  async function saveChannelEditor() {{
+    const status = document.getElementById('ce-status');
+    const channelId = document.getElementById('ce-channel-id').value.trim();
+    if (!channelId) {{ status.textContent = 'Channel ID is required'; return; }}
+    const fd = new FormData();
+    fd.append('channel_id',        channelId);
+    fd.append('display_name',      document.getElementById('ce-display-name').value.trim());
+    fd.append('guide_number',      document.getElementById('ce-guide-number').value.trim());
+    fd.append('provider',          document.getElementById('ce-provider').value);
+    fd.append('callsign',          document.getElementById('ce-callsign').value.trim());
+    fd.append('content_id',        document.getElementById('ce-content-id').value.trim());
+    fd.append('settle_time_secs',  document.getElementById('ce-settle-time').value || '20');
+    try {{
+      const res  = await fetch('/channels/save', {{method: 'POST', body: fd}});
+      const data = await res.json();
+      if (data.ok) {{
+        closeChannelEditor();
+        refreshChannelsList();
+        showToast('Channel saved');
+      }} else {{
+        status.textContent = data.error || 'Save failed';
+      }}
+    }} catch(e) {{ status.textContent = 'Network error'; }}
+  }}
+
+  async function deleteChannel(channelId) {{
+    if (!confirm('Delete this channel mapping?')) return;
+    try {{
+      await fetch(`/channels/delete/${{encodeURIComponent(channelId)}}`, {{method: 'POST'}});
+      refreshChannelsList();
+      showToast('Channel deleted');
+    }} catch(e) {{ showToast('Delete failed', false); }}
+  }}
+
+  async function toggleChannel(channelId) {{
+    try {{
+      const res  = await fetch(`/channels/toggle/${{encodeURIComponent(channelId)}}`, {{method: 'POST'}});
+      const data = await res.json();
+      if (data.ok) {{
+        showToast(data.enabled ? 'Channel enabled' : 'Channel disabled');
+        refreshChannelsList();
+      }} else {{
+        showToast(data.error || 'Toggle failed', false);
+      }}
+    }} catch(e) {{ showToast('Network error', false); }}
+  }}
+
+  async function testTuneChannel(channelId) {{
+    showToast(`Tuning ${{channelId}}… this can take up to the configured settle time`);
+    try {{
+      const res  = await fetch(`/channels/test_tune/${{encodeURIComponent(channelId)}}`, {{method: 'POST'}});
+      const data = await res.json();
+      if (data.ok) {{
+        const msg = data.already_tuned
+          ? 'Already tuned to this channel'
+          : (data.ready ? 'Tuned and ready (device confirmed playback)' : 'Tune fired but readiness gate timed out — app may not be playing');
+        showToast(msg, data.ready !== false);
+      }} else {{
+        showToast(data.error || 'Test tune failed', false);
+      }}
+      refreshChannelsList();
+    }} catch(e) {{ showToast('Network error', false); }}
+  }}
+
+  async function releaseTuner(inputId) {{
+    try {{
+      const res  = await fetch(`/channels/release/${{encodeURIComponent(inputId)}}`, {{method: 'POST'}});
+      const data = await res.json();
+      showToast(data.ok ? `Released tuner ${{inputId}}` : (data.error || 'Release failed'), data.ok);
+      refreshChannelsList();
+    }} catch(e) {{ showToast('Network error', false); }}
+  }}
+
+  // ── M3U import ────────────────────────────────────────────────────────────────
+
+  async function openM3uImport() {{
+    await _loadChannelProviders();
+    const sel = document.getElementById('m3u-import-provider');
+    if (sel && _channelProviders.length) {{
+      sel.innerHTML = _channelProviders.map(p => `<option value="${{p.key}}">${{p.label}}</option>`).join('');
+    }}
+    document.getElementById('m3u-import-status').textContent = '';
+    document.getElementById('m3u-import-overlay').classList.add('show');
+  }}
+
+  function closeM3uImport() {{
+    document.getElementById('m3u-import-overlay').classList.remove('show');
+  }}
+
+  async function submitM3uImport() {{
+    const status = document.getElementById('m3u-import-status');
+    const text = document.getElementById('m3u-import-text').value;
+    if (!text.trim()) {{ status.textContent = 'Paste an M3U playlist first'; return; }}
+    const fd = new FormData();
+    fd.append('m3u_text', text);
+    fd.append('provider', document.getElementById('m3u-import-provider').value);
+    status.textContent = 'Importing…';
+    try {{
+      const res  = await fetch('/channels/import_m3u', {{method: 'POST', body: fd}});
+      const data = await res.json();
+      if (data.ok) {{
+        status.textContent = `Imported ${{data.imported}} channel(s) ✓`;
+        showToast(`Imported ${{data.imported}} channels`);
+        refreshChannelsList();
+        setTimeout(closeM3uImport, 1200);
+      }} else {{
+        status.textContent = data.error || 'Import failed';
+      }}
+    }} catch(e) {{ status.textContent = 'Network error'; }}
+  }}
+
+  function copyExportUrl() {{
+    const url = `${{window.location.origin}}/channels/export.m3u`;
+    const status = document.getElementById('export-url-status');
+    navigator.clipboard.writeText(url).then(() => {{
+      if (status) status.textContent = `Copied: ${{url}}`;
+      showToast('Export URL copied to clipboard');
+    }}).catch(() => {{
+      if (status) status.textContent = url;
+      showToast('Could not auto-copy — URL shown below', false);
+    }});
+  }}
+
+  // ── Raw M3U view / edit ──────────────────────────────────────────────────────
+
+  async function openRawM3uEditor() {{
+    const status = document.getElementById('raw-m3u-status');
+    const textarea = document.getElementById('raw-m3u-text');
+    textarea.value = 'Loading current M3U...';
+    status.textContent = '';
+    document.getElementById('raw-m3u-overlay').classList.add('show');
+    try {{
+      const res  = await fetch('/channels/export.m3u');
+      const text = await res.text();
+      textarea.value = text;
+    }} catch(e) {{
+      textarea.value = '';
+      status.textContent = 'Could not load current M3U';
+    }}
+  }}
+
+  function closeRawM3uEditor() {{
+    document.getElementById('raw-m3u-overlay').classList.remove('show');
+  }}
+
+  async function submitRawM3uUpdate(replace) {{
+    const status = document.getElementById('raw-m3u-status');
+    const text = document.getElementById('raw-m3u-text').value;
+    if (!text.trim()) {{ status.textContent = 'Nothing to import — the text box is empty'; return; }}
+    if (replace) {{
+      const sure = confirm('This will delete every channel not present in this text and replace the whole list. Continue?');
+      if (!sure) return;
+    }}
+    const fd = new FormData();
+    fd.append('m3u_text', text);
+    fd.append('provider', 'directv_now');
+    fd.append('replace', replace ? 'true' : 'false');
+    status.textContent = replace ? 'Replacing...' : 'Updating...';
+    try {{
+      const res  = await fetch('/channels/import_m3u', {{method: 'POST', body: fd}});
+      const data = await res.json();
+      if (data.ok) {{
+        status.textContent = `${{data.replaced ? 'Replaced with' : 'Updated'}} ${{data.imported}} channel(s)`;
+        showToast(`${{data.imported}} channel(s) ${{data.replaced ? 'loaded' : 'updated'}}`);
+        refreshChannelsList();
+        setTimeout(closeRawM3uEditor, 1200);
+      }} else {{
+        status.textContent = data.error || 'Import failed';
+      }}
+    }} catch(e) {{ status.textContent = 'Network error'; }}
+  }}
+
+  async function clearAllChannels() {{
+    const sure = confirm('Delete every configured channel? This cannot be undone.');
+    if (!sure) return;
+    try {{
+      const res  = await fetch('/channels/clear_all', {{method: 'POST'}});
+      const data = await res.json();
+      showToast(data.ok ? `Cleared ${{data.cleared}} channel(s)` : 'Clear failed', data.ok);
+      refreshChannelsList();
+    }} catch(e) {{ showToast('Network error', false); }}
+  }}
+
+  refreshChannelsList();
+  loadProviderSettings();
+  loadStreamSettings();
+</script>
+</body>
+</html>"""
+
+
+
 def render_dashboard(
     live_inputs:            dict,
     cfg:                    dict,
@@ -1076,7 +1929,7 @@ def render_dashboard(
             saved_preset     = mw_cfg.get("preset",          "")
             saved_la         = mw_cfg.get("lookahead",        35)
             saved_gop        = mw_cfg.get("gop_secs",         1.5)
-            saved_gpu        = mw_cfg.get("gpu_buffers",      16)
+            saved_copy_th    = mw_cfg.get("copy_threads",     None)
             saved_vbuf       = mw_cfg.get("video_buffers",    16)
             saved_ehf        = mw_cfg.get("extra_hw_frames",  32)
             saved_p010       = mw_cfg.get("p010",             False)
@@ -1113,9 +1966,9 @@ def render_dashboard(
 
                 <div class="dl-section-lbl" style="margin-top:10px">Buffer Tuning</div>
                 <div class="dl-grid">
-                  <label class="dl-lbl" title="--gpu-buffers: VRAM queue depth (min 16)">GPU Bufs</label>
-                  <input class="dl-input" id="mw-gpu-{i}" type="number"
-                    min="16" max="256" value="{saved_gpu}" placeholder="16">
+                  <label class="dl-lbl" title="--copy-threads: number of GPU copy worker threads (magewell2ts v5-rc+ only). Leave blank to use the binary's own default (2).">Copy Threads</label>
+                  <input class="dl-input" id="mw-copyth-{i}" type="number"
+                    min="1" max="16" value="{saved_copy_th if saved_copy_th else ''}" placeholder="default (2)">
                   <label class="dl-lbl" title="--video-buffers: RAM queue depth">RAM Bufs</label>
                   <input class="dl-input" id="mw-vbuf-{i}" type="number"
                     min="1" max="256" value="{saved_vbuf}" placeholder="16">
@@ -1124,8 +1977,10 @@ def render_dashboard(
                     min="32" max="256" value="{saved_ehf}" placeholder="32">
                 </div>
                 <div class="dl-lfe-hint" style="margin-top:5px;font-size:10px">
-                  GPU load ≈ GPU&nbsp;Bufs&nbsp;+&nbsp;HW&nbsp;Extra&nbsp;+&nbsp;Lookahead&nbsp;+&nbsp;16.
-                  If encoder fails with "Invalid argument", reduce Lookahead first.
+                  Copy Threads replaces the old GPU Bufs setting — magewell2ts v5-rc+ removed
+                  --gpu-buffers in favor of a per-thread GPU copy pool. Leave blank on older
+                  binaries or to use the built-in default. Each thread holds a small fixed
+                  buffer pool internally, so 2-4 threads is normally plenty.
                 </div>
 
                 <div class="dl-section-lbl" style="margin-top:10px">Options</div>
@@ -2906,7 +3761,7 @@ def render_dashboard(
     fd.append('preset',          document.getElementById('mw-preset-'+inputId)?.value || '');
     fd.append('lookahead',       document.getElementById('mw-la-'+inputId)?.value     || '35');
     fd.append('gop_secs',        document.getElementById('mw-gop-'+inputId)?.value    || '1.5');
-    fd.append('gpu_buffers',     document.getElementById('mw-gpu-'+inputId)?.value    || '16');
+    fd.append('copy_threads',    document.getElementById('mw-copyth-'+inputId)?.value || '0');
     fd.append('video_buffers',   document.getElementById('mw-vbuf-'+inputId)?.value   || '16');
     fd.append('extra_hw_frames', document.getElementById('mw-ehf-'+inputId)?.value    || '32');
     fd.append('p010',            document.getElementById('mw-p010-'+inputId)?.checked  ? '1' : '0');
@@ -3240,6 +4095,7 @@ def render_dashboard(
     const badge = document.getElementById('cc-profile-badge');
     if (badge && profile) badge.textContent = profile;
   }}
+
 </script>
 </head>
 <body>
@@ -3252,6 +4108,7 @@ def render_dashboard(
     <button class="theme-toggle" id="theme-toggle" onclick="cycleTheme()">● Neon Ops</button>
     <a href="/mobile" class="mobile-link">Mobile ↗</a>
     <a href="/multiview" class="mobile-link" title="Quad multiviewer">Multiview ↗</a>
+    <a href="/channels" class="mobile-link" title="Channel tuning &amp; device mapping">Channels ↗</a>
     <a href="/logs" class="mobile-link" title="Real-time log viewer">Log ↗</a>
     <a href="/settings/password" class="mobile-link" title="Change password">⚙ Password</a>
     <a href="/logout" class="mobile-link" title="Sign out">Sign Out</a>

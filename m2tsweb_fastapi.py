@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request, Response, Form
 from fastapi.responses import StreamingResponse, HTMLResponse, RedirectResponse, JSONResponse
 from contextlib import asynccontextmanager
 import uvicorn
-from templates import render_dashboard, render_mobile, render_multiview
+from templates import render_dashboard, render_mobile, render_multiview, render_channels
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -471,12 +471,28 @@ def _build_capture_cmd(input_id: str, cfg: dict) -> list:
         cmd += ["-g", str(gop_secs)]
 
         # Optional: GPU / RAM buffer tuning
-        gpu_buffers     = int(cfg.get("gpu_buffers",     16))
+        # NOTE: --gpu-buffers was removed in magewell2ts v5-rc — that
+        # version replaced the single global GPU buffer count with a
+        # per-thread model (--copy-threads, each thread gets its own
+        # fixed internal buffer pool). Sending --gpu-buffers to a v5-rc+
+        # binary causes it to exit immediately with "Unrecognized
+        # option". copy_threads is optional and only sent if explicitly
+        # configured, so this remains compatible with older binaries
+        # that don't have the flag either (they simply never receive it).
         video_buffers   = int(cfg.get("video_buffers",   16))
         extra_hw_frames = int(cfg.get("extra_hw_frames", 32))
-        cmd += ["--gpu-buffers",     str(gpu_buffers)]
         cmd += ["--video-buffers",   str(video_buffers)]
         cmd += ["--extra-hw-frames", str(extra_hw_frames)]
+        copy_threads = cfg.get("copy_threads")
+        if copy_threads:
+            # NOTE: use the short form "-t", not "--copy-threads". The
+            # v5-rc binary's own --help text documents "--copy-threads"
+            # (hyphen), but its actual argument parser only accepts
+            # "-t" or "--copy_threads" (underscore) — the hyphenated
+            # long form is rejected as "Unrecognized option" despite
+            # being what --help shows. Confirmed directly against the
+            # v5-rc source (magewell2ts.cpp argument parsing loop).
+            cmd += ["-t", str(int(copy_threads))]
 
         # Optional: 10-bit p010 format
         if cfg.get("p010", False):
@@ -630,6 +646,773 @@ def _sort_ids(ids):
 # ---------------------------------------------------------------------------
 CONFIG_FILE     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "input_config.json")
 FAN_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fan_config.json")
+CHANNELS_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "channels.json")
+STREAM_SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stream_settings.json")
+
+# ---------------------------------------------------------------------------
+# Native channel tuning (replaces ah4c for mapped channels)
+# ---------------------------------------------------------------------------
+# See design-doc "Native Channel Tuning" for the full plan. This is Phase 1:
+# channel config (load/save) + a manual "Test Tune" path only. No live
+# streaming route is wired to this yet — /stream/{input_id} is completely
+# untouched by any of this.
+#
+# NOTE: ah4c's prebmitune.sh / stopbmitune.sh contents haven't been reviewed
+# yet (see design doc, open question #1). This only replicates the one
+# confirmed-working piece: `adb shell am start -S -W -a ... -d ...`, where
+# -S force-stops whatever app is currently running before launching the new
+# one. If prebmitune/stopbmitune turn out to do something load-bearing
+# beyond that, this will need revisiting.
+
+PROVIDER_PROFILES = {
+    "directv_now": {
+        "label":            "DirecTV Now / AT&T TV (deep link)",
+        # Explicit default, matches the original behavior exactly.
+        # "deeplink": am start with a URI + force-stop first (this entry).
+        # "number":   input text with the on-screen channel number, no
+        # force-stop — see directv_number below.
+        "tuning_method":    "deeplink",
+        "intent_action":    "android.intent.action.VIEW",
+        # Confirmed against the actual working bmitune.sh (2026.07.30):
+        # https:// scheme (NOT dtvnow://), path is /tune/live/channel/,
+        # and an explicit target package is appended as the final `am
+        # start` argument. No -S / -W flags are used.
+        "uri_template":     "https://deeplink.directvnow.com/tune/live/channel/{callsign}/{content_id}",
+        "package":          "com.att.tv.openvideo",
+        # Heartbeat: DirecTV's app has its own 5-minute UI inactivity
+        # timer that restarts playback if nothing resets it. bmitune.sh
+        # sends this inert keycode (draws no on-screen overlay, unlike
+        # media keys) every heartbeat_interval_secs while a channel is
+        # actively tuned.
+        "heartbeat_keycode":        "KEYCODE_ZENKAKU_HANKAKU",
+        "heartbeat_interval_secs":  180,
+        # Readiness gate: instead of (or in addition to) waiting for the
+        # Magewell card to report HDMI signal lock, poll the Android
+        # device itself for audio focus / active playback — this is
+        # what prebmitune.sh actually does, and it's faster + more
+        # direct than inferring readiness from the capture card. The
+        # exact grep patterns default to prebmitune.sh's own patterns
+        # (see _readiness_gate) and only need overriding here if a
+        # future provider's app reports state differently.
+        "readiness_timeout_secs":     10,
+        # Fixed settle delay AFTER the app reports it's playing, BEFORE
+        # capture starts. This is the deliberately simple alternative to
+        # ah4c's motion-detection + keyframe-gating machinery: since
+        # Broadcast Hub spawns a *fresh* magewell2ts process per tune
+        # (rather than filtering into an already-running continuous
+        # capture, which is what ah4c has to do), the very first frame
+        # capture produces is already a real keyframe by construction —
+        # no MPEG-TS parsing/gating needed for that part. The only
+        # remaining gap is that "app reports playing" (dumpsys) can fire
+        # a moment before the on-screen picture has actually settled past
+        # a loading spinner or channel bumper. A short fixed pause here
+        # covers that gap without needing to inspect the video content at
+        # all. Not adaptive like ah4c's real motion detection — if a
+        # given channel's loading transition runs longer than this, a
+        # brief non-content frame could still be visible — but it's a
+        # single sleep() versus a whole new subsystem, and easy to tune
+        # per-provider if needed.
+        "settle_after_ready_secs":    1.5,
+        # Sent on stop, after the heartbeat is cancelled.
+        "stop_keycode": "KEYCODE_SLEEP",
+    },
+    "directv_number": {
+        "label":            "DirecTV Now / AT&T TV (channel number)",
+        "tuning_method":    "number",
+        "package":          "com.att.tv.openvideo",
+        # CONFIRMED against real, current bmitune.sh/prebmitune.sh
+        # (osprey/dtvosprey, 2026.07.30) shared directly from the
+        # AndroidHDMI-for-Channels project, plus a forum explanation from
+        # a real user (Shaggylive, Channels DVR community, Jul 24):
+        #
+        #   "The big one is that we tune these over ADB instead of with a
+        #   real remote. That's the whole difference. When you fire an
+        #   `am start` deeplink at the box, the app sees that as another
+        #   app handing it an intent. ah4c with channel #'s uses `input
+        #   text $channelID` so no new activity is started."
+        #
+        # `input text` simulates literal remote-control keypad entry —
+        # from the app's perspective this is indistinguishable from
+        # ordinary remote use, the single most heavily-used and
+        # best-tested code path any TV app has. No am start, no URI, no
+        # package-launch intent, and critically no force-stop: you can't
+        # type a channel number into an app you just killed. This is a
+        # warm-tune-only mechanism — it requires the app to already be
+        # open and focused (see require_window_focus below); it cannot
+        # cold-start the app the way directv_now's am start can.
+        #
+        # The value typed is the channel's own guide_number field (the
+        # on-screen channel number, e.g. "249"), NOT callsign/content_id
+        # — those aren't meaningful to a real remote's number pad.
+        "heartbeat_keycode":        "KEYCODE_ZENKAKU_HANKAKU",
+        "heartbeat_interval_secs":  180,
+        "readiness_timeout_secs":     10,
+        # CONFIRMED via the real prebmitune.sh comment, verbatim:
+        # "mCurrentFocus is the only signal that says a keystroke will
+        # land; mFocusedApp stays set while asleep." A keystroke sent via
+        # `input text` goes nowhere unless the app's window is the
+        # CURRENTLY FOCUSED one — audio/media-session state alone (which
+        # is all directv_now's readiness gate checks) isn't sufficient
+        # for this tuning method, since that state can still show
+        # "playing" even while a different window has input focus, or
+        # (per the same comment) even while the device is asleep. This
+        # flag adds the extra `dumpsys window` check on top of the usual
+        # audio/media-session check — see _readiness_gate.
+        "require_window_focus":      True,
+        "settle_after_ready_secs":    1.5,
+        "stop_keycode": "KEYCODE_SLEEP",
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Provider settings overrides — the safe, user-adjustable subset
+# ---------------------------------------------------------------------------
+# PROVIDER_PROFILES above stays hardcoded in code on purpose: fields like
+# uri_template, package, intent_action, and the keycodes are protocol facts
+# confirmed against the real bmitune.sh/prebmitune.sh — getting one of them
+# wrong doesn't produce a helpful error, it just silently fails to tune.
+# Only these three numeric timing knobs are exposed for editing from the
+# Channels page, persisted separately so the protocol-critical fields can
+# never be touched from the UI:
+#   settle_after_ready_secs   — pause after readiness, before capture starts
+#   readiness_timeout_secs    — how long to wait for the app to report ready
+#   heartbeat_interval_secs   — how often the keepalive keycode fires
+PROVIDER_SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "provider_settings.json")
+_PROVIDER_SETTINGS_EDITABLE_FIELDS = {
+    "settle_after_ready_secs":  {"min": 0.0,  "max": 10.0,  "type": float},
+    "readiness_timeout_secs":   {"min": 3,    "max": 30,    "type": int},
+    "heartbeat_interval_secs":  {"min": 30,   "max": 280,   "type": int},
+}
+# JSON-safe companion for API responses — "type" as a Python type object
+# isn't serializable, so this mirrors the same ranges with a plain string
+# instead, for the UI to build number inputs from.
+_PROVIDER_SETTINGS_EDITABLE_FIELDS_JSON = {
+    field: {"min": spec["min"], "max": spec["max"], "step": 0.1 if spec["type"] is float else 1}
+    for field, spec in _PROVIDER_SETTINGS_EDITABLE_FIELDS.items()
+}
+
+provider_settings_overrides = {}
+provider_settings_lock = asyncio.Lock()
+
+
+def _load_provider_settings() -> dict:
+    try:
+        with open(PROVIDER_SETTINGS_FILE) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        log.warning("Failed to read provider_settings.json: %s", exc)
+        return {}
+
+
+def _save_provider_settings(cfg: dict) -> None:
+    config_dir = os.path.dirname(PROVIDER_SETTINGS_FILE)
+    fd, tmp = tempfile.mkstemp(dir=config_dir, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(cfg, f, indent=2)
+        os.replace(tmp, PROVIDER_SETTINGS_FILE)
+    except Exception:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
+
+
+def _get_effective_provider(provider_key: str) -> dict | None:
+    """Return the provider's settings with any saved numeric overrides
+    merged in. Only the fields in _PROVIDER_SETTINGS_EDITABLE_FIELDS can
+    ever come from the override file — everything else always comes from
+    the hardcoded PROVIDER_PROFILES, so a corrupted or malicious override
+    file can never touch protocol-critical fields like uri_template."""
+    base = PROVIDER_PROFILES.get(provider_key)
+    if base is None:
+        return None
+    effective = dict(base)
+    overrides = provider_settings_overrides.get(provider_key, {})
+    for field in _PROVIDER_SETTINGS_EDITABLE_FIELDS:
+        if field in overrides:
+            effective[field] = overrides[field]
+    return effective
+
+
+channels_config = {}
+channels_config_lock = asyncio.Lock()
+
+# Per-input tuning state: which channel is currently tuned on each input,
+# and a lock so two tune requests for the same physical input can't race.
+def _load_channels_config() -> dict:
+    try:
+        with open(CHANNELS_CONFIG_FILE) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        log.warning("Failed to read channels.json: %s", exc)
+        return {}
+
+
+def _save_channels_config(cfg: dict) -> None:
+    config_dir = os.path.dirname(CHANNELS_CONFIG_FILE)
+    fd, tmp = tempfile.mkstemp(dir=config_dir, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(cfg, f, indent=2)
+        os.replace(tmp, CHANNELS_CONFIG_FILE)
+    except Exception:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
+
+
+input_tuning_state = {}   # input_id -> {channel_id, active, tuned_at, ready}
+input_heartbeat_tasks: dict = {}   # input_id -> asyncio.Task, running while a channel is actively tuned
+
+# Single global lock covering the *entire* tuner-selection-and-launch
+# sequence, matching ah4c's own `tunerLock` exactly. This is deliberately
+# NOT a per-input lock: the whole point is that scanning the pool for a
+# free tuner and claiming one must be atomic, or two simultaneous requests
+# could both see the same idle tuner as free and race to claim it.
+tuner_selection_lock = asyncio.Lock()
+
+
+def _get_tuner_pool() -> list:
+    """Build the ordered tuner pool from existing input_config — any input
+    with an ADB remote configured is a candidate tuner. Deliberately reuses
+    the same remote_type/remote_ip fields the ADB-Home-after-recording and
+    Roku-remote features already use, rather than introducing a second,
+    separately-maintained config file that could drift out of sync with it.
+    Roku isn't included yet — see _try_tune_device.
+    Order is deterministic (matches _sort_ids, same ordering used
+    everywhere else in the app for input keys) so tuner selection is
+    reproducible run to run, mirroring ah4c's fixed-array iteration order.
+    """
+    pool = []
+    for input_id in _sort_ids(list(INPUT_IDS)):
+        cfg = input_config.get(input_id, {})
+        remote_type = cfg.get("remote_type", "none")
+        remote_ip   = cfg.get("remote_ip", "").strip()
+        if remote_type == "adb" and remote_ip:
+            pool.append((input_id, remote_ip))
+    return pool
+
+
+async def _adb_shell(remote_ip: str, args: list, timeout: int = 15):
+    """Run `adb -s {remote_ip} shell {args...}` and return the CompletedProcess.
+    args is a list of separate shell-command tokens (not a single pre-joined
+    string) — matches the working pattern already used elsewhere in this
+    file (the post-recording ADB Home command), avoiding host-side
+    shell-quoting bugs entirely."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: subprocess.run(
+            ["adb", "-s", remote_ip, "shell", *args],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    )
+
+
+async def _readiness_gate(remote_ip: str, provider: dict) -> bool:
+    """Poll the Android device itself for audio focus / active playback,
+    matching prebmitune.sh's readiness gate: the ENTIRE poll loop runs on
+    the device in one adb call (grep -q + exit codes), not the host
+    repeatedly calling adb and parsing output over the wire.
+
+    NOTE: ah4c's own Go implementation goes further than this — it takes
+    an audio-session baseline *before* tuning and waits for a genuinely
+    *new* session to appear (avoiding false positives from some other
+    already-playing audio), plus a separate video-motion gate that holds
+    back stream bytes until a real keyframe after motion is detected. That
+    is a meaningfully more robust check than this one and is a reasonable
+    follow-up once this simpler version is proven; not implemented here.
+
+    require_window_focus (used by number-tuning providers): adds a real,
+    confirmed-necessary second check on top of the above. CONFIRMED via
+    the real prebmitune.sh's own comment, verbatim: "mCurrentFocus is the
+    only signal that says a keystroke will land; mFocusedApp stays set
+    while asleep." Audio/media-session state alone can report "playing"
+    even when a different window currently has input focus (or, per that
+    same comment, even while the device is asleep) — a keystroke sent via
+    `input text` in that state goes nowhere. Deep-link tuning (am start)
+    doesn't need this, since it doesn't depend on the app's window having
+    focus at all — that's why this is opt-in per provider, not universal.
+    """
+    timeout_secs = provider.get("readiness_timeout_secs", 10)
+    package      = provider.get("package", "")
+    audio_grep   = provider.get("readiness_audio_pack_grep", f"pack: {package}.*gain: GAIN ")
+    media_grep   = provider.get("readiness_media_state_grep", r"PlaybackState \{state=3")
+
+    if provider.get("require_window_focus"):
+        window_grep = provider.get("readiness_window_focus_grep", rf"mCurrentFocus=Window.*{package}")
+        shell_script = (
+            f"end=$((SECONDS+{timeout_secs}))\n"
+            f"while [ $SECONDS -lt $end ]; do\n"
+            f"  if dumpsys audio 2>/dev/null | grep -qE '{audio_grep}' || "
+            f"dumpsys media_session 2>/dev/null | grep -qE '{media_grep}'; then\n"
+            f"    dumpsys window 2>/dev/null | grep -qE '{window_grep}' && exit 0\n"
+            f"  fi\n"
+            f"done\n"
+            f"exit 1"
+        )
+    else:
+        shell_script = (
+            f"end=$((SECONDS+{timeout_secs}))\n"
+            f"while [ $SECONDS -lt $end ]; do\n"
+            f"  dumpsys audio 2>/dev/null | grep -qE '{audio_grep}' && exit 0\n"
+            f"  dumpsys media_session 2>/dev/null | grep -qE '{media_grep}' && exit 0\n"
+            f"done\n"
+            f"exit 1"
+        )
+    try:
+        result = await _adb_shell(remote_ip, [shell_script], timeout=timeout_secs + 5)
+        return result.returncode == 0
+    except Exception as exc:
+        log.warning("Readiness gate check failed: %s", exc)
+        return False
+
+
+async def _heartbeat_loop(input_id: str, remote_ip: str, keycode: str, interval_secs: int):
+    """Background task: sends an inert keycode periodically to reset the
+    source app's own UI-inactivity timer (confirmed necessary — DirecTV's
+    app restarts playback mid-stream after 5 minutes without this). Runs
+    until cancelled (channel change, release, or explicit stop)."""
+    log.info("Heartbeat started for input %s (%s every %ds)", input_id, keycode, interval_secs)
+    try:
+        while True:
+            await asyncio.sleep(interval_secs)
+            try:
+                await _adb_shell(remote_ip, ["input", "keyevent", keycode], timeout=5)
+            except Exception as exc:
+                log.warning("Heartbeat keyevent failed for %s: %s", input_id, exc)
+    except asyncio.CancelledError:
+        log.info("Heartbeat stopped for input %s", input_id)
+        raise
+
+
+def _cancel_heartbeat(input_id: str) -> None:
+    task = input_heartbeat_tasks.pop(input_id, None)
+    if task and not task.done():
+        task.cancel()
+
+
+async def _adb_connect_with_retry(remote_ip: str, max_retries: int = 3) -> tuple:
+    """Establish/refresh the ADB connection to a device before tuning it,
+    matching prebmitune.sh's adbConnect() exactly: run `adb connect
+    {ip}`, then confirm the device actually responds via a wake keyevent,
+    retrying up to max_retries times if it doesn't.
+
+    CONFIRMED GAP, now fixed: _try_tune_device never called this at all —
+    it went straight to sending shell commands assuming a live ADB
+    connection already existed. If that connection had ever dropped
+    (device reboot, wifi blip, ADB daemon restart, or just enough time
+    passing since the last successful command), every subsequent tune
+    attempt on that device would silently fail with something like
+    "device 'x.x.x.x' not found" and no way to recover — exactly the
+    "adb says nothing is connected" symptom. This was a real, deferred
+    item from the original design doc that should have been built
+    alongside the rest of the tune sequence from the start.
+
+    Returns (ok: bool, message: str).
+    """
+    loop = asyncio.get_running_loop()
+
+    try:
+        connect_result = await loop.run_in_executor(
+            None,
+            lambda: subprocess.run(
+                ["adb", "connect", remote_ip],
+                capture_output=True, text=True, timeout=8,
+            )
+        )
+        connect_output = (connect_result.stdout + connect_result.stderr).strip()
+    except Exception as exc:
+        connect_output = f"adb connect failed to run: {exc}"
+
+    for attempt in range(max_retries + 1):
+        try:
+            wake_check = await _adb_shell(remote_ip, ["input", "keyevent", "KEYCODE_WAKEUP"], timeout=8)
+            if wake_check.returncode == 0:
+                if attempt > 0:
+                    log.info(
+                        "ADB connect: %s responded on retry %d/%d (connect output: %s)",
+                        remote_ip, attempt, max_retries, connect_output,
+                    )
+                return True, connect_output
+        except Exception as exc:
+            connect_output = f"{connect_output} | wake check failed: {exc}"
+
+        if attempt < max_retries:
+            await asyncio.sleep(1)
+            try:
+                await loop.run_in_executor(
+                    None,
+                    lambda: subprocess.run(["adb", "connect", remote_ip], capture_output=True, text=True, timeout=8)
+                )
+            except Exception:
+                pass
+
+    return False, (
+        f"Device {remote_ip} did not respond after {max_retries} reconnect "
+        f"attempts (last adb connect output: {connect_output})"
+    )
+
+
+async def _try_tune_device(input_id: str, remote_ip: str, channel_id: str, ch: dict, provider: dict) -> dict:
+    """Attempt to tune ONE specific device to a channel. Returns a dict
+    with ok=True only if the tune command ran without raising — the
+    caller (the pool-selection loop) treats ok=False here as "try the
+    next tuner", matching ah4c's failover behavior exactly (a failed pre
+    script on one device doesn't fail the whole request, it just moves on
+    to the next candidate)."""
+    tuning_method = provider.get("tuning_method", "deeplink")
+    package = provider.get("package", "")
+    t0 = time.time()
+
+    if tuning_method == "deeplink":
+        uri = provider["uri_template"].format(
+            callsign=ch.get("callsign", ""),
+            content_id=ch.get("content_id", ""),
+        )
+    else:
+        uri = None
+
+    try:
+        # CONFIRMED via a live test: forcing an EDID rewrite while
+        # watching a stream with distorted audio caused the video to
+        # visibly resync and the audio to come out clean afterward. EDID
+        # was previously only ever written once, at server startup — this
+        # refreshes it on every tune instead, so the HDMI-level
+        # negotiation gets a fresh start alongside the app-level
+        # force-stop/relaunch that already happens below. Best-effort:
+        # logged either way, but a failure here doesn't abort the tune,
+        # since the existing (possibly stale) EDID is still better than
+        # no attempt at all.
+        async with input_config_lock:
+            input_cfg_snapshot = dict(input_config.get(input_id, {}))
+        edid_path = input_cfg_snapshot.get("edid_path", "").strip()
+        if stream_settings.get("edid_refresh_on_tune", EDID_REFRESH_ON_TUNE_DEFAULT) and edid_path and os.path.isfile(edid_path):
+            board   = input_cfg_snapshot.get("board", 0)
+            board_channel = input_cfg_snapshot.get("channel", 1)
+            edid_result = await _write_edid_to_input(input_id, edid_path, board, board_channel, timeout=10)
+            t_edid = time.time()
+            log.info(
+                "Tune step [edid-refresh] input=%s took=%.2fs ok=%s raw_output=%r%s",
+                input_id, t_edid - t0, edid_result["ok"], edid_result.get("output", ""),
+                "" if edid_result["ok"] else f" error={edid_result.get('error')}",
+            )
+        else:
+            t_edid = t0
+            log.info(
+                "Tune step [edid-refresh] input=%s skipped (%s)",
+                input_id,
+                "disabled in Streaming Behavior settings" if not stream_settings.get("edid_refresh_on_tune", EDID_REFRESH_ON_TUNE_DEFAULT)
+                else "no edid_path configured",
+            )
+
+        connect_ok, connect_msg = await _adb_connect_with_retry(remote_ip)
+        t_connect = time.time()
+        log.info(
+            "Tune step [connect] input=%s remote_ip=%s took=%.2fs ok=%s (%s)",
+            input_id, remote_ip, t_connect - t_edid, connect_ok, connect_msg,
+        )
+        if not connect_ok:
+            return {"ok": False, "error": f"Device {remote_ip} unreachable: {connect_msg}"}
+
+        wake_result = await _adb_shell(remote_ip, ["input", "keyevent", "KEYCODE_WAKEUP"], timeout=10)
+        t_wake = time.time()
+        log.info(
+            "Tune step [wake] input=%s remote_ip=%s took=%.2fs returncode=%s stderr=%r",
+            input_id, remote_ip, t_wake - t_connect, wake_result.returncode, wake_result.stderr.strip(),
+        )
+
+        ready = None   # set below; number-tuning sets it before input-text, deeplink sets it after am-start
+
+        if tuning_method == "number":
+            # CONFIRMED against real bmitune.sh/prebmitune.sh (osprey/
+            # dtvosprey, 2026.07.30) and a real forum explanation — see
+            # the long comment on directv_number in PROVIDER_PROFILES.
+            # No force-stop: `input text` requires the app already open
+            # and focused; killing it first defeats the whole point.
+            guide_number = ch.get("guide_number", "").strip()
+            if not guide_number:
+                return {"ok": False, "error": f"Channel {channel_id} has no guide_number set — required for number-tuning"}
+
+            # CONFIRMED BUG, fixed here: the readiness gate used to run
+            # AFTER input text, not before. Real prebmitune.sh runs its
+            # gate FIRST, with an explicit comment explaining exactly
+            # why: "Block until the app is playing AND owns the focused
+            # window, otherwise input text goes nowhere." A live test
+            # confirmed this exact failure mode: the channel number was
+            # visibly typed on screen before the app had finished
+            # loading/waking, landed nowhere meaningful since the app's
+            # window didn't have focus yet, and the app simply resumed
+            # on whatever channel it was last on once it finished
+            # booting — recording nothing from the actually-requested
+            # channel, with clean video/audio the whole time since the
+            # capture itself never failed, it was just capturing the
+            # wrong, unchanged channel.
+            t_before_gate = time.time()
+            ready = await _readiness_gate(remote_ip, provider)
+            t_after_gate = time.time()
+            log.info(
+                "Tune step [readiness-gate-pre] input=%s remote_ip=%s took=%.2fs ready=%s",
+                input_id, remote_ip, t_after_gate - t_before_gate, ready,
+            )
+            if not ready:
+                # Matches prebmitune.sh's own documented behavior exactly:
+                # "failing tune so ah4c can try the next tuner." Firing
+                # input text into an app that isn't confirmed ready is
+                # worse than not firing it at all — it's how a real tune
+                # request silently records the wrong, stale channel.
+                return {"ok": False, "error": f"App on {remote_ip} never became ready for input — failing so another tuner can be tried"}
+
+            number_result = await _adb_shell(remote_ip, ["input", "text", guide_number], timeout=15)
+            t_start = time.time()
+            log.info(
+                "Tune step [input-text] input=%s remote_ip=%s took=%.2fs returncode=%s "
+                "channel_number=%s stdout=%r stderr=%r",
+                input_id, remote_ip, t_start - t_after_gate, number_result.returncode,
+                guide_number, number_result.stdout.strip(), number_result.stderr.strip(),
+            )
+        else:
+            # EXPERIMENT RESULT (2026-09-06): disabled force-stop to test
+            # whether it was the main source of extra latency vs ah4c's
+            # ~5.2s warm-switch time. Result: switching became unreliable
+            # without it — reverted back to True. Whatever the real
+            # difference from ah4c's working log is, it isn't simply "we
+            # don't need force-stop" — DirecTV's app evidently does NOT
+            # reliably re-tune via onNewIntent() alone in our setup, even
+            # though one specific ah4c log showed a clean warm switch. Worth
+            # investigating further (timing, intent flags, or something else
+            # ah4c does differently) before removing this again.
+            FORCE_STOP_BEFORE_TUNE = True
+            t_stop = t_wake
+            if package and FORCE_STOP_BEFORE_TUNE:
+                stop_result = await _adb_shell(remote_ip, ["am", "force-stop", package], timeout=10)
+                t_stop = time.time()
+                log.info(
+                    "Tune step [force-stop] input=%s remote_ip=%s took=%.2fs returncode=%s",
+                    input_id, remote_ip, t_stop - t_wake, stop_result.returncode,
+                )
+            am_args = ["am", "start", "-a", provider["intent_action"], "-d", uri]
+            if package:
+                am_args.append(package)
+            result = await _adb_shell(remote_ip, am_args, timeout=15)
+            t_start = time.time()
+            log.info(
+                "Tune step [am-start] input=%s remote_ip=%s took=%.2fs returncode=%s\n"
+                "  uri=%s\n  stdout=%r\n  stderr=%r",
+                input_id, remote_ip, t_start - t_stop, result.returncode,
+                uri, result.stdout.strip(), result.stderr.strip(),
+            )
+    except Exception as exc:
+        log.warning("Tune step FAILED on input=%s remote_ip=%s after %.2fs: %s",
+                     input_id, remote_ip, time.time() - t0, exc)
+        return {"ok": False, "error": f"ADB tune command failed on {input_id}: {exc}"}
+
+    if ready is None:
+        # Only reached by the deeplink path — number-tuning already ran
+        # its own gate BEFORE firing input text, above, and set ready
+        # there. Deep-link tuning keeps this as a post-hoc confirmation:
+        # am start doesn't have the same "goes nowhere silently" failure
+        # mode input text does, so checking readiness afterward (rather
+        # than gating the command on it beforehand) is still correct here.
+        t_before_gate = time.time()
+        ready = await _readiness_gate(remote_ip, provider)
+        t_after_gate = time.time()
+        log.info(
+            "Tune step [readiness-gate] input=%s remote_ip=%s took=%.2fs ready=%s "
+            "(total tune time so far: %.2fs)",
+            input_id, remote_ip, t_after_gate - t_before_gate, ready, t_after_gate - t0,
+        )
+
+    # See settle_after_ready_secs comment in PROVIDER_PROFILES: a short
+    # fixed pause here, only when the app actually reported ready, lets
+    # any residual loading transition (spinner, channel bumper) finish
+    # before capture starts — cheap alternative to real content-based
+    # gating, since our fresh-per-tune capture process already starts on
+    # a real keyframe by construction (see channel_stream/_ensure_input
+    # ordering) and doesn't need MPEG-TS-level gating for that part.
+    if ready:
+        settle_secs = provider.get("settle_after_ready_secs", 0)
+        if settle_secs:
+            await asyncio.sleep(settle_secs)
+
+    # Only claim the tuner (mark active) once we've actually attempted the
+    # tune — mirrors ah4c setting t.active=true right before returning
+    # success, not before.
+    input_tuning_state[input_id] = {
+        "channel_id": channel_id,
+        "tuned_at":   time.time(),
+        "ready":      ready,
+        "active":     True,
+    }
+
+    # CONFIRMED BUG, fixed here: the heartbeat used to only start when
+    # ready==True. But capture proceeds (_ensure_input runs) regardless
+    # of the readiness gate's outcome, and DirecTV's own 5-minute
+    # UI-inactivity timer doesn't care whether OUR readiness check
+    # happened to succeed — it's ticking on the device either way. A
+    # four-way simultaneous tune test showed exactly this gap: the two
+    # inputs whose readiness gate timed out (both under load, waiting
+    # behind other tunes) got NO heartbeat at all for the rest of the
+    # session, leaving them with zero protection against the app
+    # restarting playback mid-stream. Heartbeat now starts unconditionally
+    # whenever a tune attempt completes without raising, matching what it
+    # actually protects against.
+    heartbeat_kc  = provider.get("heartbeat_keycode")
+    heartbeat_int = provider.get("heartbeat_interval_secs", 0)
+    if heartbeat_kc and heartbeat_int:
+        input_heartbeat_tasks[input_id] = asyncio.create_task(
+            _heartbeat_loop(input_id, remote_ip, heartbeat_kc, heartbeat_int)
+        )
+
+    if not ready:
+        log.warning(
+            "Channel tune: %s on input %s failed readiness gate within %ds — "
+            "app may not actually be playing (heartbeat started anyway)",
+            channel_id, input_id, provider.get("readiness_timeout_secs", 10),
+        )
+
+    return {"ok": True, "input_id": input_id, "ready": ready}
+
+
+async def _select_and_tune_channel(channel_id: str) -> dict:
+    """Auto-select a free tuner from the pool and tune it to a channel,
+    with real failover — if one candidate device fails, try the next.
+    Matches ah4c's tune(idx="auto", channel) behavior: single global lock
+    over the whole scan-and-claim operation, fixed iteration order, skip
+    anything already marked active, first success wins.
+    """
+    async with channels_config_lock:
+        ch = channels_config.get(channel_id)
+    if not ch:
+        return {"ok": False, "error": f"Unknown channel_id: {channel_id}"}
+
+    provider_key = ch.get("provider", "")
+    provider = _get_effective_provider(provider_key)
+    if not provider:
+        return {"ok": False, "error": f"Unknown provider: {provider_key}"}
+
+    # Timing note: tuner_selection_lock is held for the ENTIRE tune
+    # sequence below (wake/force-stop/am-start/readiness-gate for
+    # whichever device is chosen) — matching ah4c's own single global
+    # tunerLock design. This means a slow tune on one device genuinely
+    # blocks a completely unrelated, already-free second device from
+    # being tuned until the lock releases. Logged here so a real test
+    # with two devices will show exactly how long the lock was held and
+    # by which request, rather than this being invisible.
+    t_wait_start = time.time()
+    async with tuner_selection_lock:
+        t_acquired = time.time()
+        wait_time = t_acquired - t_wait_start
+        if wait_time > 0.5:
+            log.warning(
+                "Channel %s waited %.2fs for tuner_selection_lock (another "
+                "tune was in progress) before its own attempt could start",
+                channel_id, wait_time,
+            )
+        async with input_config_lock:
+            candidates = _get_tuner_pool()
+
+        if not candidates:
+            return {"ok": False, "error": "No ADB-configured inputs available as tuners"}
+
+        # Already tuned to this exact channel on an active tuner? Reuse it
+        # rather than re-firing the deep-link.
+        for input_id, _ in candidates:
+            state = input_tuning_state.get(input_id, {})
+            if state.get("active") and state.get("channel_id") == channel_id:
+                return {"ok": True, "already_tuned": True, "input_id": input_id}
+
+        last_error = None
+        for input_id, remote_ip in candidates:
+            state = input_tuning_state.get(input_id, {})
+            if state.get("active"):
+                continue   # busy — matches ah4c's `if ti.active { continue }`
+
+            result = await _try_tune_device(input_id, remote_ip, channel_id, ch, provider)
+            if result.get("ok"):
+                log.info(
+                    "Channel %s tuned successfully on %s — held tuner_selection_lock for %.2fs total",
+                    channel_id, input_id, time.time() - t_acquired,
+                )
+                return {"ok": True, "already_tuned": False, **result}
+            last_error = result.get("error")
+            log.warning("Tuner %s failed (%s) — trying next available tuner", input_id, last_error)
+
+        log.warning(
+            "Channel %s: no available tuner succeeded — held tuner_selection_lock for %.2fs total",
+            channel_id, time.time() - t_acquired,
+        )
+        return {"ok": False, "error": f"No available tuner could complete the tune (last error: {last_error})"}
+
+
+async def _release_tuner(input_id: str) -> dict:
+    """Release a tuner: cancel its heartbeat, sleep the device, and mark
+    it free again in the pool. Matches stopbmitune.sh's sequence.
+
+    NOTE: this used to unconditionally return ok=True regardless of
+    whether the actual ADB sleep command reached the device — meaning a
+    genuinely unreachable/broken device on release would silently look
+    "successful" from the caller's perspective, with only a log warning
+    to notice it by. Fixed to report the real outcome, and to log every
+    step (not just failures) so a per-device diagnosis is actually
+    possible from the log alone.
+
+    CONFIRMED RACE, fixed here: input_tuning_state used to only get
+    popped AFTER the (slow, real network round-trip) sleep command
+    completed. A same-channel reconnect arriving in that window — which
+    can be milliseconds after release starts, e.g. Channels DVR moving
+    from one recording to the next on the same channel — would see the
+    input still marked "active" with the OLD channel_id, correctly (by
+    its own logic) treat it as "already tuned, just reuse it," and skip
+    a fresh tune entirely. But the device was, at that exact moment,
+    actively being put to sleep in the background — so the reused
+    connection found a device going dark, sat with no data for ~15s,
+    timed out, and only THEN triggered a real fresh tune. Net effect: a
+    same-channel handoff that should have been seamless (or at worst one
+    clean re-tune) instead took two attempts and ~30 real seconds.
+    Clearing state immediately, before the slow sleep call, closes this:
+    any request arriving during release now correctly sees the input as
+    not-currently-known-good and does a real fresh tune right away,
+    rather than trusting stale state that's already being invalidated.
+    """
+    async with input_config_lock:
+        input_cfg = input_config.get(input_id, {})
+        remote_ip = input_cfg.get("remote_ip", "").strip()
+
+    current = input_tuning_state.pop(input_id, {})
+    channel_id = current.get("channel_id")
+
+    log.info("Release: input=%s remote_ip=%s was_tuned_to=%s", input_id, remote_ip, channel_id)
+
+    _cancel_heartbeat(input_id)
+
+    sleep_ok = None   # None = not attempted (no remote_ip configured)
+    if remote_ip:
+        try:
+            result = await _adb_shell(remote_ip, ["input", "keyevent", "KEYCODE_SLEEP"], timeout=10)
+            sleep_ok = (result.returncode == 0)
+            log.info(
+                "Release: sleep keyevent to %s (input %s) -> returncode=%s stdout=%r stderr=%r",
+                remote_ip, input_id, result.returncode, result.stdout.strip(), result.stderr.strip(),
+            )
+        except Exception as exc:
+            sleep_ok = False
+            log.warning("Release: sleep command failed for input %s (%s): %s", input_id, remote_ip, exc)
+    else:
+        log.warning("Release: input %s has no remote_ip configured — nothing to sleep", input_id)
+
+    # Report real outcome: only a hard ADB failure is treated as not-ok.
+    # No remote_ip configured is still a successful release of our own
+    # bookkeeping (there was never a device to sleep), just worth noting.
+    ok = sleep_ok is not False
+    result = {"ok": ok, "input_id": input_id, "was_tuned_to": channel_id, "device_slept": sleep_ok}
+    if not ok:
+        result["error"] = f"Device {remote_ip} did not respond to the sleep command — released internally, but the physical device may still be awake/showing the last channel."
+    return result
 
 _fan_config      = {}
 _fan_config_lock = asyncio.Lock()
@@ -719,7 +1502,8 @@ def _save_config(cfg: dict, active: list, hidden: set, user_prefs: dict = None):
                     "preset":          v.get("preset", ""),
                     "lookahead":       v.get("lookahead", 35),
                     "gop_secs":        v.get("gop_secs", 1.5),
-                    "gpu_buffers":     v.get("gpu_buffers", 16),
+                    "gpu_buffers":     v.get("gpu_buffers", 16),   # legacy field, no longer sent to magewell2ts v5-rc+; kept for backward compatibility with older builds
+                    "copy_threads":    v.get("copy_threads", None),
                     "video_buffers":   v.get("video_buffers", 16),
                     "extra_hw_frames": v.get("extra_hw_frames", 32),
                     "p010":            v.get("p010", False),
@@ -779,7 +1563,8 @@ def _build_entry(key: str, board_or_dl, inp: int, channel: int,
         "preset":          saved_mw.get("preset",          ""),
         "lookahead":       saved_mw.get("lookahead",        35),
         "gop_secs":        saved_mw.get("gop_secs",         1.5),
-        "gpu_buffers":     saved_mw.get("gpu_buffers",      16),
+        "gpu_buffers":     saved_mw.get("gpu_buffers",      16),   # legacy field, see comment in _save_config
+        "copy_threads":    saved_mw.get("copy_threads",     None),
         "video_buffers":   saved_mw.get("video_buffers",    16),
         "extra_hw_frames": saved_mw.get("extra_hw_frames",  32),
         "p010":            saved_mw.get("p010",             False),
@@ -880,6 +1665,8 @@ input_config, INPUT_IDS, HIDDEN_IDS = _bootstrap()
 
 # Load fan/CC config
 _fan_config = _load_fan_config()
+channels_config = _load_channels_config()
+provider_settings_overrides = _load_provider_settings()
 
 # Activate CoolerControl default mode at startup so the correct
 # profile is applied immediately rather than waiting for activity
@@ -1129,13 +1916,22 @@ _PUBLIC_PATHS = {
     # HDHomeRun emulation — read by Plex/Channels/Emby/Jellyfin, which
     # cannot authenticate through Broadcast Hub's login form.
     "/discover.json", "/lineup.json", "/lineup.xml", "/lineup_status.json",
+    # Channel M3U export — same reasoning, read by DVR clients directly.
+    "/channels/export.m3u",
 }
 _PUBLIC_PREFIXES = (
     "/hls/", "/stream/",
     # UPnP/DLNA — read by VLC and other DLNA browsers, which likewise
     # cannot authenticate.
     "/upnp/",
+    # Channel streaming — the actual tune-then-stream URLs handed out in
+    # the M3U above. Deliberately "/channel/" (singular), NOT "/channels/"
+    # (plural) — the plural prefix is the channel *management* API
+    # (save/delete/import) and must stay behind login.
+    "/channel/",
 )
+
+_REAL_PAGE_PATHS = {"/", "/mobile", "/multiview", "/channels", "/logs", "/settings/password"}
 
 async def _auth_middleware(request: Request, call_next):
     path = request.url.path
@@ -1152,10 +1948,23 @@ async def _auth_middleware(request: Request, call_next):
 
     # Check session cookie
     if not _auth.is_authenticated(request):
-        if request.method == "GET":
+        # Only serve the full login page for a real, known page route. For
+        # anything else (API-style paths, or garbage paths from a confused
+        # client), return a minimal plain-text 401 instead.
+        #
+        # This matters beyond correctness: a client that mistakes an HTML
+        # response for something else (confirmed in practice — an M3U
+        # consumer that received the login page for an unauthenticated
+        # request, then treated every line of that HTML as a channel URL
+        # to fetch) would previously get ANOTHER full login page for each
+        # of those garbage requests too, since literally any unrecognized
+        # path served one — turning one bad response into a
+        # self-amplifying storm of requests. A short plain-text 401 body
+        # gives a confused client nothing further to misparse, so the
+        # loop can't feed itself.
+        if request.method == "GET" and path in _REAL_PAGE_PATHS:
             return _auth.login_page(next_url=request.url.path)
-        # For POST/etc from an unauthenticated client, return 401
-        return Response(status_code=401, content="Session expired — please log in.")
+        return Response(status_code=401, content="Unauthorized", media_type="text/plain")
 
     return await call_next(request)
 
@@ -1207,6 +2016,34 @@ async def update_stats_loop():
 async def watchdog_loop():
     while True:
         await asyncio.sleep(3)
+
+        # Sweep for a real, confirmed edge case: if a client disconnects in
+        # the narrow window while _select_and_tune_channel is still in
+        # flight (after a tuner is claimed/marked active, but before the
+        # channel_stream generator resumes to register a real viewer via
+        # _ensure_input), the tuner can be left permanently marked "active"
+        # with no active_inputs entry ever created for it, and nothing else
+        # will ever release it. Confirmed happening in practice via the
+        # warning logged at the cancellation site — this sweep is the
+        # proper fix that was deferred until it was seen occurring.
+        # Grace period is generous (20s) to comfortably clear normal
+        # tune+_ensure_input timing (which can itself take 10-13s) without
+        # racing a legitimately-still-tuning request.
+        now_sweep = time.time()
+        for input_id, state in list(input_tuning_state.items()):
+            if not state.get("active"):
+                continue
+            if input_id in active_inputs:
+                continue   # has a real capture/viewer behind it, not stuck
+            tuned_at = state.get("tuned_at", 0)
+            if now_sweep - tuned_at > 20:
+                log.warning(
+                    "Watchdog: input %s has been marked active for %.0fs with "
+                    "no active_inputs entry — likely a tuner leaked from a "
+                    "cancelled-mid-tune request; releasing it",
+                    input_id, now_sweep - tuned_at,
+                )
+                asyncio.create_task(_release_tuner(input_id))
 
         to_respawn = []
         now = time.time()
@@ -1438,6 +2275,96 @@ async def edid_refresh_loop():
 
 
 # ---------------------------------------------------------------------------
+# Stray device sleep sweep
+# ---------------------------------------------------------------------------
+# CONFIRMED GAP: every part of the app's device-sleep logic is entirely
+# reactive, scoped to devices WE ourselves tuned (input_tuning_state only
+# ever gets an entry via a real tune request through our own code). A
+# device that becomes awake outside that lifecycle — e.g. a firmware
+# update triggers a restart, and the box wakes up showing whatever
+# channel it defaults to, with no client ever requesting it through
+# Broadcast Hub — is completely invisible to every existing mechanism.
+# Nothing would ever notice or correct it; it would just sit there awake
+# indefinitely. This periodic sweep closes that gap: check every
+# tuner-pool device NOT currently claimed by our own tuning state, and if
+# it's actually awake anyway, put it back to sleep.
+STRAY_DEVICE_SLEEP_DEFAULT = True
+STRAY_DEVICE_SWEEP_INTERVAL_DEFAULT_SECS = 60
+# Floor, not just a suggestion: each sweep pass now briefly takes
+# tuner_selection_lock per device (see the race-condition fix below), so
+# an interval configured too aggressively would mean this contends with
+# real tuning traffic more often than it needs to, for very little
+# actual benefit — a stray device sitting awake an extra 10s vs 20s
+# rarely matters, but shaving lock-contention risk during a real burst
+# of tuning does.
+STRAY_DEVICE_SWEEP_INTERVAL_MIN_SECS = 15
+
+
+async def stray_device_sleep_loop():
+    while True:
+        try:
+            interval = stream_settings.get("stray_device_sweep_interval_secs", STRAY_DEVICE_SWEEP_INTERVAL_DEFAULT_SECS)
+            interval = max(STRAY_DEVICE_SWEEP_INTERVAL_MIN_SECS, interval)
+            await asyncio.sleep(interval)
+
+            if not stream_settings.get("stray_device_sleep", STRAY_DEVICE_SLEEP_DEFAULT):
+                continue
+
+            async with input_config_lock:
+                pool = _get_tuner_pool()
+
+            for input_id, remote_ip in pool:
+                # CONFIRMED GAP, closed here: this used to read
+                # input_tuning_state with no lock at all. _select_and_tune_
+                # channel holds tuner_selection_lock for its ENTIRE
+                # duration and only marks a device "active" at the very
+                # end, after the readiness gate completes — which can be
+                # several seconds into a tune. A sweep checking a device
+                # in that window (woken as part of a genuine, still-in-
+                # flight tune, but not yet marked active) could wrongly
+                # conclude it's stray and sleep it mid-tune, disrupting a
+                # real, legitimate live view or recording. Acquiring the
+                # same lock here means: if a real tune is genuinely in
+                # progress for this device, this simply waits for it to
+                # finish (at which point "active" is accurate) before
+                # ever deciding whether to act — it can never act on a
+                # device mid-tune. The tradeoff is a small, bounded delay
+                # to any brand-new tune request that happens to arrive
+                # while this per-device check is running (since the lock
+                # is global, not per-device) — a clearly better tradeoff
+                # than risking a live view or recording being disrupted.
+                async with tuner_selection_lock:
+                    state = input_tuning_state.get(input_id, {})
+                    if state.get("active"):
+                        continue   # a real tune of ours is in progress here — leave it alone
+
+                    try:
+                        result = await _adb_shell(remote_ip, ["dumpsys", "power"], timeout=10)
+                        m = re.search(r"mWakefulness=(\w+)", result.stdout)
+                        if m and m.group(1) == "Awake":
+                            log.warning(
+                                "Stray device sweep: input %s (%s) is awake with no "
+                                "active tune of ours — likely woke up on its own "
+                                "(e.g. a firmware update restart) and is showing "
+                                "whatever channel it defaulted to; putting it back "
+                                "to sleep",
+                                input_id, remote_ip,
+                            )
+                            sleep_result = await _adb_shell(remote_ip, ["input", "keyevent", "KEYCODE_SLEEP"], timeout=10)
+                            log.info(
+                                "Stray device sweep: sleep keyevent to %s (input %s) -> returncode=%s",
+                                remote_ip, input_id, sleep_result.returncode,
+                            )
+                    except Exception as exc:
+                        log.warning("Stray device sweep: check failed for %s (%s): %s", input_id, remote_ip, exc)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("stray_device_sleep_loop error: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Fan / CoolerControl manager loop
 # ---------------------------------------------------------------------------
 async def fan_manager_loop():
@@ -1599,6 +2526,7 @@ async def lifespan(app: FastAPI):
     schedule_task = asyncio.create_task(schedule_runner())
     fan_task      = asyncio.create_task(fan_manager_loop())
     edid_task     = asyncio.create_task(edid_refresh_loop())
+    stray_task    = asyncio.create_task(stray_device_sleep_loop())
 
     # UPnP/DLNA SSDP — best-effort; a failure here (e.g. port 1900 already
     # in use by another SSDP responder on this machine) is logged but
@@ -1614,7 +2542,10 @@ async def lifespan(app: FastAPI):
         schedule_task.cancel()
         fan_task.cancel()
         edid_task.cancel()
+        stray_task.cancel()
         ssdp_announce_task.cancel()
+        for hb_input_id in list(input_heartbeat_tasks.keys()):
+            _cancel_heartbeat(hb_input_id)
         if ssdp_transport is not None:
             try:
                 ssdp_transport.close()
@@ -1622,7 +2553,7 @@ async def lifespan(app: FastAPI):
                 pass
         await asyncio.gather(
             stats_task, watchdog_task, schedule_task, fan_task, edid_task,
-            ssdp_announce_task,
+            stray_task, ssdp_announce_task,
             return_exceptions=True,
         )
 
@@ -1750,6 +2681,20 @@ async def distributor(input_id, process):
                     if idle_since is None:
                         idle_since = loop.time()
                     elif loop.time() - idle_since > 10:
+                        # Same backstop as the stale-eviction path above —
+                        # this is the other route to "genuinely zero
+                        # viewers," and should equally guarantee the tuner
+                        # gets released even if channel_stream()'s own
+                        # generator cleanup never ran. Idempotent/harmless
+                        # if it also ran there already.
+                        if input_tuning_state.get(input_id, {}).get("active"):
+                            log.info(
+                                "Distributor: %s idle for 10s+ with zero viewers "
+                                "and is an active channel tune — releasing tuner "
+                                "as a backstop before capture shutdown",
+                                input_id,
+                            )
+                            asyncio.create_task(_release_tuner(input_id))
                         break
                 else:
                     idle_since = None
@@ -1778,6 +2723,27 @@ async def distributor(input_id, process):
                             )
                         if len(live) == 0:
                             SHOULD_BE_LIVE.pop(input_id, None)
+                            # Backstop for a real, confirmed bug: channel_stream()'s
+                            # own generator is *supposed* to notice a disconnect and
+                            # call _release_tuner() itself, but a real test showed
+                            # it can get orphaned (VLC not closing the connection
+                            # cleanly) — the generator never ran its own cleanup at
+                            # all, and the tuner only got released when the whole
+                            # app was shut down with Ctrl+C. This eviction path,
+                            # unlike that generator, has been reliably firing all
+                            # along — so hook the release into it directly rather
+                            # than depend on the generator's own cleanup working.
+                            # Guarded to only affect inputs that are actually part
+                            # of an active channel tune; harmless/idempotent if
+                            # called again later by the generator's own cleanup too.
+                            if input_tuning_state.get(input_id, {}).get("active"):
+                                log.info(
+                                    "Distributor: %s has zero viewers after stale "
+                                    "eviction and is an active channel tune — "
+                                    "releasing tuner as a backstop",
+                                    input_id,
+                                )
+                                asyncio.create_task(_release_tuner(input_id))
 
             # Check first whether the process has already died — avoids
             # issuing a doomed read against a closed/dead pipe.
@@ -2158,6 +3124,7 @@ async def set_magewell_cfg(
     lookahead:       int   = Form(35),
     gop_secs:        float = Form(1.5),
     gpu_buffers:     int   = Form(16),
+    copy_threads:    int   = Form(0),   # 0 = unset, let magewell2ts use its own default
     video_buffers:   int   = Form(16),
     extra_hw_frames: int   = Form(32),
     p010:            str   = Form("0"),
@@ -2187,7 +3154,8 @@ async def set_magewell_cfg(
             "preset":          preset.strip(),
             "lookahead":       max(0, min(lookahead, 120)),
             "gop_secs":        max(0.0, round(gop_secs, 2)),
-            "gpu_buffers":     max(16, min(gpu_buffers,     256)),
+            "gpu_buffers":     max(16, min(gpu_buffers,     256)),   # legacy, no longer used by magewell2ts v5-rc+
+            "copy_threads":    (max(1, min(copy_threads, 16)) if copy_threads else None),
             "video_buffers":   max(1,  min(video_buffers,   256)),
             "extra_hw_frames": max(32, min(extra_hw_frames, 256)),
             "p010":            p010 in ("1", "true", "on"),
@@ -2375,6 +3343,56 @@ async def edid_read(input_id: str):
             pass
 
 
+async def _write_edid_to_input(input_id: str, edid_path: str, board: int, channel: int, timeout: int = 15) -> dict:
+    """Core EDID-write mechanism, shared between the manual test route and
+    the automatic per-tune refresh below. Runs magewell2ts -w, which
+    causes the capture card to re-announce its declared capabilities over
+    HDMI — this is what actually triggers the connected source device to
+    re-read EDID and re-negotiate its output format.
+
+    CONFIRMED important, not just theoretical: a live test showed
+    manually forcing this while watching a stream with distorted audio
+    caused the video to visibly resync and the audio to come out clean
+    afterward. EDID was previously only ever written once, at server
+    startup — never refreshed again until the next full restart. Given
+    how much sleep/wake and force-stop/relaunch cycling a device goes
+    through in normal operation, there's no reason to expect that
+    original negotiation state to still be valid hours later.
+
+    IMPORTANT, confirmed directly from magewell2ts's own source
+    (Magewell::WriteEDID in Magewell.cpp): this function calls the SDK's
+    MWSetEDID and only LOGS whether that call succeeded — it returns
+    `true` unconditionally regardless of the actual result. That means
+    the process's exit code alone cannot be trusted to mean the write
+    actually worked. The real signal is the printed text: "EDID written
+    successfully" vs "Failed to write EDID!". This function checks that
+    text explicitly rather than trusting returncode==0 alone.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(
+            None,
+            lambda: subprocess.run(
+                ["magewell2ts", "-w", edid_path, "-b", str(board), "-i", str(channel)],
+                capture_output=True, text=True, timeout=timeout,
+            )
+        )
+        output = (result.stdout + result.stderr).strip()
+        if result.returncode != 0:
+            return {"ok": False, "error": f"magewell2ts -w failed (code {result.returncode}): {output}", "output": output}
+        if "failed to write edid" in output.lower():
+            return {"ok": False, "error": f"magewell2ts reported failure despite exit code 0: {output}", "output": output}
+        if "edid written successfully" not in output.lower():
+            # Neither confirmed success nor confirmed failure text seen —
+            # don't claim success on faith; surface it clearly instead.
+            return {"ok": False, "error": f"No success confirmation in output (unclear result): {output}", "output": output}
+        return {"ok": True, "output": output}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "magewell2ts timed out writing EDID"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 @app.post("/input/{input_id:path}/edid/write")
 async def edid_write(input_id: str, edid_path: str = Form(...)):
     """Write an EDID .bin file to the capture input.
@@ -2383,7 +3401,9 @@ async def edid_write(input_id: str, edid_path: str = Form(...)):
 
     Reminder: the written EDID does not survive a reboot.  The saved
     edid_path in input_config.json is used to re-apply it automatically
-    each time the capture process starts (via _build_capture_cmd).
+    each time the capture process starts (via _build_capture_cmd), and is
+    now ALSO re-applied automatically on every channel tune — see the
+    [edid-refresh] step in _try_tune_device.
     """
     edid_path = edid_path.strip()
     if not edid_path:
@@ -2402,27 +3422,11 @@ async def edid_write(input_id: str, edid_path: str = Form(...)):
     board   = cfg.get("board",   0)
     channel = cfg.get("channel", 1)
 
-    loop = asyncio.get_running_loop()
-    try:
-        result = await loop.run_in_executor(
-            None,
-            lambda: subprocess.run(
-                ["magewell2ts", "-w", edid_path, "-b", str(board), "-i", str(channel)],
-                capture_output=True, text=True, timeout=15,
-            )
-        )
-        output = (result.stdout + result.stderr).strip()
-        if result.returncode != 0:
-            return JSONResponse({
-                "ok":    False,
-                "error": f"magewell2ts -w failed (code {result.returncode}): {output}",
-            })
+    result = await _write_edid_to_input(input_id, edid_path, board, channel)
+    if result["ok"]:
         log.info("EDID written to input %s: %s", input_id, edid_path)
-        return JSONResponse({"ok": True, "output": output})
-    except subprocess.TimeoutExpired:
-        return JSONResponse({"ok": False, "error": "magewell2ts timed out writing EDID"}, status_code=504)
-    except Exception as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+        return JSONResponse(result)
+    return JSONResponse(result)
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -2907,7 +3911,733 @@ async def restore_input(input_id: str):
 # Routes — CoolerControl integration
 # ---------------------------------------------------------------------------
 
-@app.get("/fans/config")
+# ---------------------------------------------------------------------------
+# Routes — native channel tuning (Phase 1: config + manual test only)
+# ---------------------------------------------------------------------------
+
+@app.get("/channels/providers")
+async def channels_list_providers():
+    return JSONResponse({
+        "ok": True,
+        "providers": [{"key": k, "label": v["label"]} for k, v in PROVIDER_PROFILES.items()],
+    })
+
+
+@app.get("/channels/stream_settings")
+async def channels_get_stream_settings():
+    async with stream_settings_lock:
+        return JSONResponse({
+            "ok": True,
+            "same_client_eviction": stream_settings.get("same_client_eviction", SAME_CLIENT_EVICTION_DEFAULT),
+            "edid_refresh_on_tune": stream_settings.get("edid_refresh_on_tune", EDID_REFRESH_ON_TUNE_DEFAULT),
+            "stray_device_sleep":   stream_settings.get("stray_device_sleep", STRAY_DEVICE_SLEEP_DEFAULT),
+            "stray_device_sweep_interval_secs": stream_settings.get(
+                "stray_device_sweep_interval_secs", STRAY_DEVICE_SWEEP_INTERVAL_DEFAULT_SECS
+            ),
+        })
+
+
+@app.post("/channels/stream_settings")
+async def channels_save_stream_settings(
+    same_client_eviction: bool = Form(...),
+    edid_refresh_on_tune: bool = Form(...),
+    stray_device_sleep:   bool = Form(...),
+    stray_device_sweep_interval_secs: int = Form(STRAY_DEVICE_SWEEP_INTERVAL_DEFAULT_SECS),
+):
+    """Toggle same-client channel-switch eviction. On: correct for a
+    single interactive viewer (VLC etc.) switching channels — the old
+    channel is stopped the moment a new one is requested, rather than
+    waiting up to ~30-40s for it to be noticed as abandoned. Off:
+    required for a DVR doing concurrent multi-channel recording (e.g.
+    Channels DVR recording several channels at once) from one server IP
+    — with this on, every new recording starting would incorrectly tear
+    down every other recording already in progress from that same DVR.
+
+    Also toggles EDID-refresh-on-tune — see EDID_REFRESH_ON_TUNE_DEFAULT
+    for why it defaults on, and _try_tune_device for where it's applied.
+
+    And stray-device-sleep, plus its sweep interval — see
+    STRAY_DEVICE_SLEEP_DEFAULT and stray_device_sleep_loop for the gap
+    this closes: a device that wakes up outside our own tune lifecycle
+    (e.g. a firmware update restart) is otherwise completely invisible
+    to every existing sleep mechanism and would run awake indefinitely.
+    The interval is clamped server-side to STRAY_DEVICE_SWEEP_INTERVAL_
+    MIN_SECS regardless of what's submitted, since each sweep pass briefly
+    takes the same lock real tuning needs — configuring this too
+    aggressively would mean needless contention for very little benefit.
+    """
+    interval = max(STRAY_DEVICE_SWEEP_INTERVAL_MIN_SECS, stray_device_sweep_interval_secs)
+    async with stream_settings_lock:
+        stream_settings["same_client_eviction"] = same_client_eviction
+        stream_settings["edid_refresh_on_tune"] = edid_refresh_on_tune
+        stream_settings["stray_device_sleep"]   = stray_device_sleep
+        stream_settings["stray_device_sweep_interval_secs"] = interval
+        _save_stream_settings(stream_settings)
+    return JSONResponse({
+        "ok": True,
+        "same_client_eviction": same_client_eviction,
+        "edid_refresh_on_tune": edid_refresh_on_tune,
+        "stray_device_sleep":   stray_device_sleep,
+        "stray_device_sweep_interval_secs": interval,
+    })
+
+
+@app.get("/channels/provider_settings")
+async def channels_get_provider_settings():
+    """Return each provider's current effective timing settings (defaults
+    merged with any saved overrides), plus the valid min/max range for
+    each editable field so the UI can build appropriate number inputs."""
+    async with provider_settings_lock:
+        overrides_snapshot = dict(provider_settings_overrides)
+    result = {}
+    for key, base in PROVIDER_PROFILES.items():
+        result[key] = {
+            "label": base["label"],
+            "values": {
+                field: overrides_snapshot.get(key, {}).get(field, base.get(field))
+                for field in _PROVIDER_SETTINGS_EDITABLE_FIELDS
+            },
+        }
+    return JSONResponse({
+        "ok": True,
+        "providers": result,
+        "field_ranges": _PROVIDER_SETTINGS_EDITABLE_FIELDS_JSON,
+    })
+
+
+@app.post("/channels/provider_settings/{provider_key}")
+async def channels_save_provider_settings(
+    provider_key: str,
+    settle_after_ready_secs: float = Form(...),
+    readiness_timeout_secs:  int   = Form(...),
+    heartbeat_interval_secs: int   = Form(...),
+):
+    """Save the three safe numeric overrides for one provider. Every
+    value is clamped to its allowed range server-side regardless of what
+    the client sends — the UI enforces the same ranges, but this is the
+    actual guarantee, since protocol-critical fields (uri_template,
+    package, keycodes) are never accepted here at all, only these three
+    named form fields."""
+    if provider_key not in PROVIDER_PROFILES:
+        return JSONResponse({"ok": False, "error": f"Unknown provider: {provider_key}"}, status_code=400)
+
+    def _clamp(value, field):
+        spec = _PROVIDER_SETTINGS_EDITABLE_FIELDS[field]
+        value = spec["type"](value)
+        return max(spec["min"], min(value, spec["max"]))
+
+    new_values = {
+        "settle_after_ready_secs": _clamp(settle_after_ready_secs, "settle_after_ready_secs"),
+        "readiness_timeout_secs":  _clamp(readiness_timeout_secs,  "readiness_timeout_secs"),
+        "heartbeat_interval_secs": _clamp(heartbeat_interval_secs, "heartbeat_interval_secs"),
+    }
+
+    async with provider_settings_lock:
+        provider_settings_overrides[provider_key] = new_values
+        _save_provider_settings(provider_settings_overrides)
+
+    return JSONResponse({"ok": True, "values": new_values})
+
+
+@app.get("/channels/list")
+async def channels_list():
+    async with channels_config_lock:
+        chs = dict(channels_config)
+    async with input_config_lock:
+        pool = _get_tuner_pool()
+    pool_input_ids = {iid for iid, _ in pool}
+    rows = []
+    for channel_id, ch in chs.items():
+        row = dict(ch)
+        row["channel_id"] = channel_id
+        # "currently tuned" now means: is ANY tuner in the pool currently
+        # active and tuned to this channel — channels no longer own a
+        # fixed input, so this has to scan the pool rather than check one
+        # hardcoded input_id.
+        tuned_on = None
+        for input_id, state in input_tuning_state.items():
+            if state.get("active") and state.get("channel_id") == channel_id:
+                tuned_on = input_id
+                break
+        row["currently_tuned"] = tuned_on is not None
+        row["tuned_input_id"]  = tuned_on
+        rows.append(row)
+    return JSONResponse({
+        "ok": True,
+        "channels": rows,
+        "tuner_pool_size": len(pool_input_ids),
+        "tuner_pool_busy": sum(1 for iid in pool_input_ids if input_tuning_state.get(iid, {}).get("active")),
+    })
+
+
+@app.post("/channels/save")
+async def channels_save(
+    channel_id:   str = Form(...),
+    display_name: str = Form(""),
+    guide_number: str = Form(""),
+    provider:     str = Form(""),
+    callsign:     str = Form(""),
+    content_id:   str = Form(""),
+    settle_time_secs: int = Form(20),
+    enabled:      bool = Form(True),
+):
+    # NOTE: no input_id field — channels are no longer tied to a fixed
+    # input. Which physical device serves a given channel request is
+    # decided at tune time by _select_and_tune_channel, from whichever
+    # ADB-configured inputs are currently free (see design notes: this
+    # matches ah4c's actual tuner-pool model, confirmed against its real
+    # source — a fixed 1:1 channel-to-input mapping would have capped
+    # available channels at the number of physical inputs).
+    channel_id = channel_id.strip()
+    if not channel_id:
+        return JSONResponse({"ok": False, "error": "channel_id is required"}, status_code=400)
+    if provider not in PROVIDER_PROFILES:
+        return JSONResponse({"ok": False, "error": f"Unknown provider: {provider}"}, status_code=400)
+    async with channels_config_lock:
+        channels_config[channel_id] = {
+            "display_name":     display_name.strip() or channel_id,
+            "guide_number":     guide_number.strip(),
+            "provider":         provider,
+            "callsign":         callsign.strip(),
+            "content_id":       content_id.strip(),
+            "settle_time_secs": max(5, min(settle_time_secs, 120)),
+            "enabled":          enabled,
+        }
+        _save_channels_config(channels_config)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/channels/toggle/{channel_id:path}")
+async def channels_toggle(channel_id: str):
+    """Quick enable/disable flip for one channel, without opening the
+    full editor. A disabled channel stays in channels.json (so nothing
+    is lost) but is skipped by the M3U export and refuses to tune —
+    useful for temporarily hiding a channel that is not currently
+    working, or ones the user does not want cluttering their guide,
+    without deleting the mapping entirely."""
+    async with channels_config_lock:
+        if channel_id not in channels_config:
+            return JSONResponse({"ok": False, "error": f"Unknown channel_id: {channel_id}"}, status_code=404)
+        current = channels_config[channel_id].get("enabled", True)
+        channels_config[channel_id]["enabled"] = not current
+        _save_channels_config(channels_config)
+        new_state = channels_config[channel_id]["enabled"]
+    return JSONResponse({"ok": True, "channel_id": channel_id, "enabled": new_state})
+
+
+def _parse_m3u_channels(m3u_text: str, default_provider: str) -> list:
+    """Parse an M3U playlist, supporting two distinct URL formats:
+
+    1. Deep-link style (CALLSIGN~CONTENTID in the URL):
+        #EXTINF:-1 channel-id="77" channel-number="77" ...,MeTV
+        http://{{ .IPADDRESS }}/play/tuner/METV~83321f4e-2ac2-...
+
+    2. Number-tuning style (bare channel number in the URL, no tilde) —
+       CONFIRMED via a real user's actual M3U export, which caused every
+       single line to fail to match format 1's tilde-requiring regex,
+       correctly parsing zero channels and returning "No channels found":
+        #EXTINF:-1 channel-id="77" channel-number="77" ...,MeTV
+        http://{{ .IPADDRESS }}/play/tuner/77
+
+    Format 2 is what a number-tuning provider (see directv_number in
+    PROVIDER_PROFILES) actually needs — there's no callsign/content_id
+    involved in that tuning method at all, only the on-screen channel
+    number, which is exactly what this URL style encodes directly.
+
+    Returns a list of channel dicts ready to save. Deliberately tolerant
+    of the exact #EXTINF attribute set (only channel-number is actually
+    used; other attributes like tvc-guide-stationid are ignored here,
+    since we don't yet have a use for them) and of either http(s):// or
+    a bare path in the URL line, so real-world M3U exports — which may or
+    may not have had their {{ .IPADDRESS }} template substituted — both
+    parse correctly, regardless of which of the two URL styles is used.
+    """
+    channels = []
+    lines = [l.strip() for l in m3u_text.splitlines() if l.strip()]
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("#EXTINF"):
+            # Extract channel-number="N" if present
+            m_num = re.search(r'channel-number="([^"]*)"', line)
+            guide_number = m_num.group(1) if m_num else ""
+            # Display name is everything after the last comma on this line
+            display_name = line.rsplit(",", 1)[-1].strip() if "," in line else ""
+
+            # The URL is expected on the next non-comment line
+            if i + 1 < len(lines) and not lines[i + 1].startswith("#"):
+                url_line = lines[i + 1]
+                # Try format 1 first: CALLSIGN~CONTENTID segment at the
+                # end of the URL path, regardless of scheme/host/template
+                # placeholder.
+                m_ch = re.search(r'/([^/~]+)~([^/~]+)\s*$', url_line)
+                if m_ch:
+                    callsign, content_id = m_ch.group(1), m_ch.group(2)
+                    channel_id = f"{callsign}~{content_id}"
+                    channels.append({
+                        "channel_id":       channel_id,
+                        "display_name":     display_name or channel_id,
+                        "guide_number":     guide_number,
+                        "provider":         default_provider,
+                        "callsign":         callsign,
+                        "content_id":       content_id,
+                        "settle_time_secs": 20,
+                        "enabled":          True,
+                    })
+                else:
+                    # Format 2 fallback: no tilde anywhere in the URL —
+                    # treat the bare trailing path segment as the channel
+                    # number itself. No callsign/content_id exist for
+                    # this format; they're simply not used by a
+                    # number-tuning provider's actual tune command.
+                    m_bare = re.search(r'/([^/]+)\s*$', url_line)
+                    if m_bare:
+                        bare_number = m_bare.group(1)
+                        channel_id = bare_number
+                        channels.append({
+                            "channel_id":       channel_id,
+                            "display_name":     display_name or channel_id,
+                            "guide_number":     guide_number or bare_number,
+                            "provider":         default_provider,
+                            "callsign":         "",
+                            "content_id":       "",
+                            "settle_time_secs": 20,
+                            "enabled":          True,
+                        })
+                i += 2
+                continue
+        i += 1
+    return channels
+
+
+@app.post("/channels/import_m3u")
+async def channels_import_m3u(
+    m3u_text: str = Form(...),
+    provider: str = Form("directv_now"),
+    replace:  bool = Form(False),
+):
+    """Bulk-import channels from a pasted M3U playlist.
+
+    Default (replace=False): existing channel IDs are updated in place
+    (their guide number/display name refreshed, but their enabled/
+    disabled state is preserved rather than reset back to enabled),
+    anything not in the pasted M3U is left untouched, and new channels
+    are added. Safe and idempotent to re-run whenever a provider's
+    lineup changes.
+
+    replace=True: the entire existing channel list is cleared first,
+    then the pasted M3U becomes the complete new list. Used for
+    "start over with a different M3U" rather than merging into what is
+    already there.
+    """
+    if provider not in PROVIDER_PROFILES:
+        return JSONResponse({"ok": False, "error": f"Unknown provider: {provider}"}, status_code=400)
+
+    parsed = _parse_m3u_channels(m3u_text, provider)
+    if not parsed:
+        return JSONResponse({"ok": False, "error": "No channels found — check the pasted M3U format"}, status_code=400)
+
+    async with channels_config_lock:
+        if replace:
+            channels_config.clear()
+        for ch in parsed:
+            channel_id = ch.pop("channel_id")
+            if not replace and channel_id in channels_config:
+                # Preserve enabled/disabled state on an existing channel
+                # being refreshed — re-importing an updated M3U should
+                # not silently re-enable something the user turned off.
+                ch["enabled"] = channels_config[channel_id].get("enabled", True)
+            channels_config[channel_id] = ch
+        _save_channels_config(channels_config)
+
+    return JSONResponse({"ok": True, "imported": len(parsed), "replaced": replace})
+
+
+@app.post("/channels/clear_all")
+async def channels_clear_all():
+    """Delete every configured channel. Deliberately a separate, explicit
+    action rather than a side effect of anything else — this is
+    destructive and unrecoverable (short of re-importing), so it should
+    only ever happen when the user asks for it directly."""
+    async with channels_config_lock:
+        count = len(channels_config)
+        channels_config.clear()
+        _save_channels_config(channels_config)
+    return JSONResponse({"ok": True, "cleared": count})
+
+
+def _load_stream_settings() -> dict:
+    try:
+        with open(STREAM_SETTINGS_FILE) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        log.warning("Failed to read stream_settings.json: %s", exc)
+        return {}
+
+
+def _save_stream_settings(cfg: dict) -> None:
+    config_dir = os.path.dirname(STREAM_SETTINGS_FILE)
+    fd, tmp = tempfile.mkstemp(dir=config_dir, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(cfg, f, indent=2)
+        os.replace(tmp, STREAM_SETTINGS_FILE)
+    except Exception:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
+
+
+stream_settings = _load_stream_settings()
+stream_settings_lock = asyncio.Lock()
+# NOTE on this default: True matches the original assumption (one client
+# watches one channel at a time — e.g. a person browsing channels in
+# VLC), where evicting whatever that client was previously watching the
+# moment they request something new is exactly the desired behavior.
+# Confirmed WRONG for a DVR doing concurrent multi-channel recording
+# (e.g. Channels DVR recording 4 channels at once) — every one of those
+# requests comes from the DVR server's single IP, and this eviction
+# logic can't tell "switching channels" apart from "starting another
+# simultaneous stream," since the HTTP layer alone gives no way to
+# distinguish them reliably. Toggle this off for DVR/multi-recording
+# use, on for a single interactive viewer.
+SAME_CLIENT_EVICTION_DEFAULT = True
+# Confirmed via a live test to fix real audio corruption (forcing an EDID
+# rewrite mid-stream caused a visible resync and cleared distorted audio
+# afterward). Defaults on for that reason, but it does add a small delay
+# to every single tune (whatever magewell2ts -w takes, typically well
+# under a second) — toggle off to isolate it during testing, or if a
+# specific setup finds it isn't helping.
+EDID_REFRESH_ON_TUNE_DEFAULT = True
+
+
+async def _release_same_client_viewers(client_ip: str, new_channel_id: str, exclude_input_id: str = None) -> None:
+    """Proactively tear down anything the SAME client is already watching
+    on OTHER inputs, before tuning a new channel for them.
+
+    This closes a real gap: our disconnect-detection only reacts to an
+    HTTP connection actually closing, or to the ~30-40s stale-viewer
+    timeout if it doesn't. Nothing previously tied "this client is
+    requesting a new channel" to "so whatever they were just watching
+    should stop" — those were two entirely independent code paths. If a
+    client (VLC or otherwise) doesn't promptly/cleanly close its old
+    connection when switching channels, the old tuner could sit occupied
+    for up to ~30-40s doing nothing useful, which is a serious problem
+    with a small tuner pool — a second channel-switch attempt could find
+    zero tuners free and appear to simply fail, even though nothing is
+    really being watched on the "stuck" one.
+
+    This mirrors how a real remote control works: picking a new channel
+    implicitly stops the old one, from the same remote/client, rather
+    than waiting for some independent timeout to notice.
+
+    IMPORTANT: if the client is reconnecting to the SAME channel it was
+    already tuned to on some input (a brief network hiccup, not a real
+    channel switch), that input's tuner is NOT released — only the stale
+    viewer entry is removed. Otherwise every reconnect to the same
+    channel would force a full re-tune (9-12+ seconds) instead of hitting
+    the existing "already_tuned" fast path in _select_and_tune_channel.
+    """
+    async with inputs_lock:
+        for input_id, entry in list(active_inputs.items()):
+            if input_id == exclude_input_id:
+                continue
+            matching = [v for v in entry.get("viewers", []) if v.get("ip") == client_ip]
+            if not matching:
+                continue
+            for v in matching:
+                stop_event = v.get("stop_event")
+                if stop_event is not None:
+                    stop_event.set()
+            entry["viewers"] = [v for v in entry["viewers"] if v.get("ip") != client_ip]
+            entry["viewer_count"] = len(entry["viewers"])
+            remaining = entry["viewer_count"]
+
+            same_channel = input_tuning_state.get(input_id, {}).get("channel_id") == new_channel_id
+            log.info(
+                "Channel stream: proactively evicting %s from %s (%s) — "
+                "%d viewer(s) remaining on that input",
+                client_ip, input_id,
+                "reconnecting to the same channel, tuner kept" if same_channel else "switching to a different channel",
+                remaining,
+            )
+            if remaining == 0 and not same_channel:
+                SHOULD_BE_LIVE.pop(input_id, None)
+                if input_tuning_state.get(input_id, {}).get("active"):
+                    asyncio.create_task(_release_tuner(input_id))
+
+
+@app.get("/channel/{channel_id:path}/stream")
+async def channel_stream(channel_id: str, request: Request):
+    """The missing piece from the original design doc: a single playable
+    URL per channel that auto-selects a free tuner, tunes it, and streams
+    the result — exactly mirroring ah4c's own /play/tuner/:channel route.
+
+    Mechanically this is a thin wrapper around the exact same
+    queue/viewer/cleanup pattern /stream/{input_id} already uses (reusing
+    _ensure_input and the same distributor-fed queue), with one addition:
+    when the last viewer disconnects, the tuner is released back to the
+    pool (heartbeat cancelled, device slept) rather than staying claimed
+    indefinitely — a tuner nobody is watching should be free for the next
+    channel request, the same way a physical tuner would be.
+
+    IMPORTANT: the actual tune (wake/force-stop/am-start/readiness-gate,
+    which can take 9-12+ seconds) happens INSIDE the generator below, not
+    before this function returns its StreamingResponse. This was a real,
+    confirmed bug in the original version — awaiting the full tune before
+    returning ANY response meant VLC (and presumably other clients) never
+    even received HTTP headers for 10+ seconds, past most clients'
+    connection timeouts, causing "input can't be opened" errors even
+    though the tune was succeeding server-side. Worse, since nothing
+    cancels an in-flight tune when the client gives up, a client that
+    times out and retries a different channel would queue up behind the
+    abandoned tune's hold on the single global tuner_selection_lock,
+    producing exactly the "several channels appear to tune before landing
+    on the right one" cascade. Returning the response immediately and
+    doing the slow work inside the generator means the client's
+    connection succeeds right away; it just sees normal buffering for a
+    few seconds instead of an outright connection failure — a much more
+    forgiving position for any client's timeout handling to be in.
+
+    A fast, cheap validity check (does this channel_id exist at all) is
+    still done up front, synchronously, so a genuinely bad channel_id
+    still gets an immediate 404 rather than paying for a doomed tune
+    attempt inside the generator.
+    """
+    async with channels_config_lock:
+        if channel_id not in channels_config:
+            return JSONResponse({"ok": False, "error": f"Unknown channel_id: {channel_id}"}, status_code=404)
+        if not channels_config[channel_id].get("enabled", True):
+            return JSONResponse({"ok": False, "error": f"Channel {channel_id} is disabled"}, status_code=404)
+
+    client_ip = request.client.host if request.client else "unknown"
+
+    # Tear down anything this same client was already watching on a
+    # different input BEFORE tuning the new channel — see
+    # _release_same_client_viewers for why this matters, and why this is
+    # now gated on a setting: it's correct for a single interactive
+    # viewer switching channels, and actively wrong for a DVR doing
+    # concurrent multi-channel recording from one server IP (confirmed —
+    # it was tearing down in-progress recordings on other inputs every
+    # time a new one started). This only does quick in-memory bookkeeping
+    # here when enabled; the actual (slow) device-sleep command for
+    # whatever gets released runs as a background task, so this doesn't
+    # reintroduce the slow-response problem fixed earlier.
+    if stream_settings.get("same_client_eviction", SAME_CLIENT_EVICTION_DEFAULT):
+        await _release_same_client_viewers(client_ip, channel_id)
+
+    async def stream_from_queue():
+        # KNOWN EDGE CASE, not yet fully handled: if the client disconnects
+        # in the narrow window while this specific await is in flight
+        # (after a tuner has been claimed/marked active inside
+        # _select_and_tune_channel, but before this generator resumes to
+        # register a real viewer), the tuner could be left marked "active"
+        # with nothing ever watching it or releasing it. Logged clearly
+        # here so it's visible if it ever actually happens rather than
+        # silently leaking a tuner — worth adding a periodic staleness
+        # sweep (e.g. in watchdog_loop) as a proper fix if this shows up
+        # in practice, rather than building it now against a
+        # not-yet-confirmed scenario.
+        try:
+            tune_result = await _select_and_tune_channel(channel_id)
+        except (asyncio.CancelledError, GeneratorExit):
+            log.warning(
+                "Channel stream: %s tune attempt for %s was cancelled mid-flight "
+                "(client disconnected during tuning) — a tuner may be left "
+                "claimed with no viewer; check for a stuck-active tuner if "
+                "this repeats",
+                channel_id, client_ip,
+            )
+            raise
+        if not tune_result.get("ok"):
+            log.warning(
+                "Channel stream: %s -> tune failed for %s: %s",
+                channel_id, client_ip, tune_result.get("error"),
+            )
+            return   # ends the response body; client sees a short/empty stream, not a hang
+        input_id = tune_result["input_id"]
+
+        queue = asyncio.Queue(maxsize=500)
+        stop_event = asyncio.Event()
+        viewer = {
+            "queue":        queue,
+            "ip":           client_ip,
+            "connected_at": time.time(),
+            "last_read":    time.time(),
+            "stop_event":   stop_event,
+        }
+
+        log.info("Channel stream: %s -> input %s, new connection from %s", channel_id, input_id, client_ip)
+        async with inputs_lock:
+            await _ensure_input(input_id, viewer)
+            new_count = active_inputs[input_id].get("viewer_count", 0)
+            if new_count == 1 and input_id not in SHOULD_BE_LIVE:
+                SHOULD_BE_LIVE[input_id] = {"restart_count": 0, "last_restart": 0, "faulted": False}
+
+        # CONFIRMED BUG, fixed here: _release_same_client_viewers used to
+        # only remove a viewer from active_inputs[...]["viewers"] — it
+        # never actually woke up THIS generator, which just kept sitting
+        # on `await queue.get()` for up to 15 more seconds, completely
+        # unaware it had been evicted. When its own timeout eventually
+        # fired, its finally block released whatever input_id it
+        # remembered — which by then could easily be a BRAND NEW,
+        # still-in-progress tune that had since reused the same input.
+        # Confirmed happening in a real four-input test: a release logged
+        # was_tuned_to=None, meaning it fired before the new tune on that
+        # same input had even finished setting its own channel state.
+        # Racing against stop_event here means eviction wakes this
+        # generator immediately instead of leaving it to time out on its
+        # own schedule days after it stopped being relevant.
+        stop_task = asyncio.ensure_future(stop_event.wait())
+        evicted = False
+        consecutive_timeouts = 0
+        try:
+            while True:
+                get_task = asyncio.ensure_future(queue.get())
+                done, pending = await asyncio.wait(
+                    {get_task, stop_task}, timeout=5.0, return_when=asyncio.FIRST_COMPLETED
+                )
+                if stop_task in done:
+                    get_task.cancel()
+                    evicted = True
+                    log.info(
+                        "Channel stream: %s -> %s woken by proactive eviction "
+                        "(client switched channels), closing immediately",
+                        client_ip, input_id,
+                    )
+                    break
+                if get_task in done:
+                    chunk = get_task.result()
+                    consecutive_timeouts = 0
+                    viewer["last_read"] = time.time()
+                    yield chunk
+                else:
+                    get_task.cancel()
+                    consecutive_timeouts += 1
+                    if consecutive_timeouts >= 3:
+                        log.warning("Channel stream: %s -> %s timed out waiting for data, closing", client_ip, input_id)
+                        break
+        except GeneratorExit:
+            pass
+        finally:
+            stop_task.cancel()
+            remaining = 0
+            async with inputs_lock:
+                if input_id in active_inputs:
+                    active_inputs[input_id]["viewers"] = [
+                        v for v in active_inputs[input_id]["viewers"] if v["queue"] is not queue
+                    ]
+                    remaining = len(active_inputs[input_id]["viewers"])
+                    active_inputs[input_id]["viewer_count"] = remaining
+                    log.info(
+                        "Channel stream: %s disconnected from %s (channel %s), %d viewer(s) remaining",
+                        client_ip, input_id, channel_id, remaining,
+                    )
+                    if remaining == 0:
+                        SHOULD_BE_LIVE.pop(input_id, None)
+            # Skip release here if we were woken by proactive eviction —
+            # _release_same_client_viewers already released this exact
+            # input_id at the moment eviction actually happened, which is
+            # the only moment that's guaranteed correct. Releasing again
+            # here, potentially much later, risks hitting whatever new
+            # tune has since claimed the same input — precisely the bug
+            # a previous fix closed.
+            #
+            # CONFIRMED BUG, fixed here separately: this used to `await
+            # _release_tuner(input_id)` directly, inside this finally
+            # block. When the client disconnects, the ASGI framework
+            # cancels the task driving this generator — and Python's
+            # asyncio can deliver that cancellation INTO code already
+            # running inside a finally block, interrupting whatever
+            # await is in flight at that exact moment. A real log showed
+            # this happening: the sleep-keyevent step inside
+            # _release_tuner never logged at all (neither success nor
+            # failure) after a real disconnect, meaning the function was
+            # being cut off mid-execution by the very disconnect that
+            # triggered it — the device never actually got put to sleep,
+            # even though our own bookkeeping showed a clean release.
+            # asyncio.create_task() dispatches this as an independent
+            # task that keeps running even if THIS generator's own task
+            # gets cancelled — matching every other _release_tuner call
+            # site in the codebase, all of which already use create_task
+            # for exactly this reason.
+            if remaining == 0 and not evicted:
+                asyncio.create_task(_release_tuner(input_id))
+
+    return StreamingResponse(stream_from_queue(), media_type="video/mp2t")
+
+
+@app.get("/channels/export.m3u")
+async def channels_export_m3u(request: Request):
+    """Serve the current channel list as a standard M3U, with each entry
+    pointing at the real, working /channel/{id}/stream URL above — so any
+    DVR/media client (Channels DVR's "Custom Channels" source, Plex, VLC,
+    etc.) can be pointed at this single URL to get every configured
+    channel, auto-tuning through whichever tuner is free at request time.
+    """
+    base = _hdhr_base_url(request)
+    async with channels_config_lock:
+        chs = dict(channels_config)
+    lines = ["#EXTM3U"]
+    for channel_id, ch in chs.items():
+        if not ch.get("enabled", True):
+            continue
+        guide_number = ch.get("guide_number", "")
+        display_name = ch.get("display_name", channel_id)
+        lines.append(f'#EXTINF:-1 channel-number="{guide_number}",{display_name}')
+        lines.append(f'{base}/channel/{channel_id}/stream')
+    body = "\n".join(lines) + "\n"
+    return Response(content=body, media_type="audio/x-mpegurl")
+
+
+@app.post("/channels/delete/{channel_id:path}")
+async def channels_delete(channel_id: str):
+    async with channels_config_lock:
+        if channel_id in channels_config:
+            del channels_config[channel_id]
+            _save_channels_config(channels_config)
+    # If any tuner in the pool happens to currently be tuned to the
+    # deleted channel, leave its tuning state alone (it's still a valid
+    # live tune, just no longer has a channel-list entry) — deleting the
+    # channel definition shouldn't yank an active stream out from under
+    # a viewer. Nothing to clean up here beyond the config itself.
+    return JSONResponse({"ok": True})
+
+
+@app.post("/channels/test_tune/{channel_id:path}")
+async def channels_test_tune(channel_id: str):
+    """Manually trigger auto-tuner-selection for a channel: picks the
+    first free ADB-configured input from the pool, fires the deep-link,
+    waits for the on-device readiness gate, and starts the heartbeat —
+    without touching any streaming route. Includes real failover: if the
+    first candidate tuner fails, the next one is tried automatically,
+    matching ah4c's confirmed behavior.
+
+    Safe to call any time; this is exactly what Phase 1 is for: verifying
+    the pool-selection + tune + readiness + heartbeat sequence works
+    before any of it is wired into a real DVR-facing stream."""
+    result = await _select_and_tune_channel(channel_id)
+    status_code = 200 if result.get("ok") else 400
+    return JSONResponse(result, status_code=status_code)
+
+
+@app.post("/channels/release/{input_id:path}")
+async def channels_release(input_id: str):
+    """Manually release a tuner back to the pool: cancels the heartbeat
+    and sleeps the device, matching stopbmitune.sh. Route renamed from
+    the earlier /channels/stop_tune to reflect that this frees the tuner
+    for the pool rather than just stopping one fixed channel/input pair."""
+    async with input_config_lock:
+        if input_id not in INPUT_IDS:
+            return JSONResponse({"ok": False, "error": f"Unknown input_id: {input_id}"}, status_code=400)
+    result = await _release_tuner(input_id)
+    return JSONResponse(result)
+
+
+# ---------------------------------------------------------------------------
+# Routes — fan config
 async def fans_get_config():
     async with _fan_config_lock:
         cfg = dict(_fan_config)
@@ -2994,8 +4724,14 @@ def _hdhr_base_url(request: Request) -> str:
 @app.get("/discover.json")
 async def hdhr_discover(request: Request):
     base = _hdhr_base_url(request)
+    # CHANGED: TunerCount now reflects the real tuner pool (ADB-capable
+    # devices that can actually be channel-tuned), not the raw physical
+    # input count. This matches how a real cable HDHomeRun device works
+    # — advertising a lineup that can be far larger than the number of
+    # simultaneous physical tuners it actually has; the two numbers are
+    # expected to differ, not match.
     async with input_config_lock:
-        tuner_count = len(INPUT_IDS)
+        tuner_count = len(_get_tuner_pool())
     return JSONResponse({
         "FriendlyName":    HDHR_FRIENDLY_NAME,
         "ModelNumber":     HDHR_MODEL_NUMBER,
@@ -3021,43 +4757,54 @@ async def hdhr_lineup_status():
 
 @app.get("/lineup.json")
 async def hdhr_lineup(request: Request):
+    """REPLACED: this used to list the raw physical inputs, with URLs
+    pointing at /stream/{input_id} — whatever happened to be manually
+    showing on that physical box, with no relation to the channel-tuning
+    system built later in this project. Now lists the actual configured
+    channels instead, exactly matching /channels/export.m3u's own logic
+    (same enabled filter, same guide_number/display_name fields, same
+    /channel/{id}/stream URL) — so any HDHomeRun-native client (Plex,
+    Jellyfin, Kodi, or Channels DVR via native discovery instead of its
+    M3U source) can discover and use the full channel-tuning pipeline
+    directly, with real guide numbers and names, no M3U import needed.
+    """
     base = _hdhr_base_url(request)
-    async with input_config_lock:
-        ids_snapshot = list(INPUT_IDS)
-        cfg_snapshot = {k: dict(v) for k, v in input_config.items() if k in ids_snapshot}
+    async with channels_config_lock:
+        chs = dict(channels_config)
 
-    channels = []
-    for idx, key in enumerate(_sort_ids(ids_snapshot), start=1):
-        cfg = cfg_snapshot.get(key, {})
-        guide_number = str(cfg.get("hdhr_channel_number") or idx)
-        guide_name   = cfg.get("hdhr_channel_name") or _label(key)
-        channels.append({
-            "GuideNumber": guide_number,
-            "GuideName":   guide_name,
-            "URL":         f"{base}/stream/{key}",
+    lineup = []
+    for channel_id, ch in chs.items():
+        if not ch.get("enabled", True):
+            continue
+        lineup.append({
+            "GuideNumber": ch.get("guide_number", "") or channel_id,
+            "GuideName":   ch.get("display_name", channel_id),
+            "URL":         f"{base}/channel/{channel_id}/stream",
         })
-    return JSONResponse(channels)
+    return JSONResponse(lineup)
 
 
 @app.get("/lineup.xml")
 async def hdhr_lineup_xml(request: Request):
-    """Some clients request the XML form of the lineup instead of JSON."""
+    """Some clients request the XML form of the lineup instead of JSON.
+    REPLACED to match lineup.json's new channels-based source — see that
+    route's docstring for why."""
     base = _hdhr_base_url(request)
-    async with input_config_lock:
-        ids_snapshot = list(INPUT_IDS)
-        cfg_snapshot = {k: dict(v) for k, v in input_config.items() if k in ids_snapshot}
+    async with channels_config_lock:
+        chs = dict(channels_config)
 
     import xml.sax.saxutils as _sax
     rows = []
-    for idx, key in enumerate(_sort_ids(ids_snapshot), start=1):
-        cfg = cfg_snapshot.get(key, {})
-        guide_number = str(cfg.get("hdhr_channel_number") or idx)
-        guide_name   = cfg.get("hdhr_channel_name") or _label(key)
+    for channel_id, ch in chs.items():
+        if not ch.get("enabled", True):
+            continue
+        guide_number = ch.get("guide_number", "") or channel_id
+        guide_name   = ch.get("display_name", channel_id)
         rows.append(
             "  <Program>\n"
             f"    <GuideNumber>{_sax.escape(guide_number)}</GuideNumber>\n"
             f"    <GuideName>{_sax.escape(guide_name)}</GuideName>\n"
-            f"    <URL>{_sax.escape(base)}/stream/{_sax.escape(key)}</URL>\n"
+            f"    <URL>{_sax.escape(base)}/channel/{_sax.escape(channel_id)}/stream</URL>\n"
             "  </Program>"
         )
     xml_body = "<Lineup>\n" + "\n".join(rows) + "\n</Lineup>"
@@ -3067,10 +4814,19 @@ async def hdhr_lineup_xml(request: Request):
 # ---------------------------------------------------------------------------
 # UPnP / DLNA MediaServer — makes Broadcast Hub appear under "Universal
 # Plug'n'Play" in VLC and other DLNA browsers, with a "Channels" folder
-# listing each active input, the same way a real HDHomeRun's built-in DLNA
-# server does. This is a *separate* discovery mechanism from the HDHomeRun
-# HTTP endpoints above — those are for Plex/Channels/Emby/Jellyfin, this
-# is for generic DLNA clients like VLC's "Universal Plug'n'Play" browser.
+# listing each configured channel, the same way a real HDHomeRun's built-in
+# DLNA server does. This is a *separate* discovery mechanism from the
+# HDHomeRun HTTP endpoints above — those are for Plex/Channels/Emby/
+# Jellyfin, this is for generic DLNA clients like VLC's "Universal
+# Plug'n'Play" browser.
+#
+# REPLACED (previously listed raw physical inputs, pointing at
+# /stream/{input_id} — meaning a board only ever showed up here if it
+# happened to already be manually awake and playing something at that
+# exact moment, and showed nothing while asleep, which is its normal
+# state between tunes): now built from channels.json, same source
+# /lineup.json uses, so browsing here goes through the real tuning
+# pipeline on demand rather than depending on incidental prior state.
 #
 # Three pieces, all purely additive (new UDP listener + new HTTP routes,
 # nothing in the capture/distributor pipeline is touched):
@@ -3080,7 +4836,7 @@ async def hdhr_lineup_xml(request: Request):
 #      with ContentDirectory and ConnectionManager services.
 #   3. A minimal ContentDirectory SOAP "Browse" implementation that
 #      returns a root "Channels" container, and inside it one item per
-#      active input pointing at the existing /stream/{id} URL.
+#      configured, enabled channel pointing at /channel/{id}/stream.
 # ---------------------------------------------------------------------------
 
 UPNP_UUID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "upnp_uuid.txt")
@@ -3369,10 +5125,19 @@ def _didl_escape(text: str) -> str:
 async def upnp_cd_control(request: Request):
     """Minimal ContentDirectory Browse implementation.
 
-    Structure: root (\"0\") contains one container, \"channels\" (\"1\").
-    Browsing \"1\" returns one item per active input, each pointing at
-    the existing /stream/{id} URL — no new streaming logic, just a DLNA
-    listing wrapped around what Broadcast Hub already serves.
+    Structure: root ("0") contains one container, "channels" ("1").
+    Browsing "1" returns one item per configured channel.
+
+    REPLACED: this used to list the raw physical inputs, pointing at
+    /stream/{input_id} — meaning a board only ever showed up here if it
+    happened to be manually awake and playing something at that exact
+    moment, and showed nothing at all while asleep (the normal state
+    between tunes). Now lists the actual configured channels instead,
+    exactly matching /lineup.json's source (channels.json, same enabled
+    filter, same guide_number/display_name fields, same
+    /channel/{id}/stream URL) — so browsing here goes through the real
+    tuning pipeline on demand, the same way any other channel request
+    does, rather than depending on a board's incidental prior state.
     """
     raw = await request.body()
     text = raw.decode(errors="replace")
@@ -3384,33 +5149,34 @@ async def upnp_cd_control(request: Request):
 
     base = _hdhr_base_url(request)
 
-    async with input_config_lock:
-        ids_snapshot = list(INPUT_IDS)
-        cfg_snapshot = {k: dict(v) for k, v in input_config.items() if k in ids_snapshot}
-    sorted_ids = _sort_ids(ids_snapshot)
+    async with channels_config_lock:
+        chs = dict(channels_config)
+    enabled_channels = [
+        (channel_id, ch) for channel_id, ch in chs.items() if ch.get("enabled", True)
+    ]
 
     didl_items = []
     if object_id == "0":
         # Root: one child container, "Channels"
         didl_items.append(
-            f'<container id="channels" parentID="0" restricted="1" childCount="{len(sorted_ids)}">'
+            f'<container id="channels" parentID="0" restricted="1" childCount="{len(enabled_channels)}">'
             f'<dc:title>Channels</dc:title><upnp:class>object.container</upnp:class></container>'
         )
         total_matches = 1
     else:
-        # "channels" (or anything else): list every active input as a playable item
-        for idx, key in enumerate(sorted_ids, start=1):
-            cfg = cfg_snapshot.get(key, {})
-            title = cfg.get("hdhr_channel_name") or _label(key)
-            stream_url = f"{base}/stream/{key}"
+        # "channels" (or anything else): list every configured, enabled
+        # channel as a playable item
+        for channel_id, ch in enabled_channels:
+            title = ch.get("display_name", channel_id)
+            stream_url = f"{base}/channel/{channel_id}/stream"
             didl_items.append(
-                f'<item id="ch-{_didl_escape(key)}" parentID="channels" restricted="1">'
+                f'<item id="ch-{_didl_escape(channel_id)}" parentID="channels" restricted="1">'
                 f'<dc:title>{_didl_escape(title)}</dc:title>'
                 f'<upnp:class>object.item.videoItem</upnp:class>'
                 f'<res protocolInfo="http-get:*:video/mpeg:*">{_didl_escape(stream_url)}</res>'
                 f'</item>'
             )
-        total_matches = len(sorted_ids)
+        total_matches = len(enabled_channels)
 
     didl = (
         '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
@@ -3686,6 +5452,17 @@ async def multiview():
     async with inputs_lock:
         live_ids = list(active_inputs.keys())
     return render_multiview(all_ids, live_ids, cfg)
+
+
+# ---------------------------------------------------------------------------
+# Channels page — channel tuning config + input/device mapping
+# ---------------------------------------------------------------------------
+@app.get("/channels", response_class=HTMLResponse)
+async def channels_page():
+    async with input_config_lock:
+        all_ids = list(INPUT_IDS)
+        cfg     = {iid: dict(input_config.get(iid, {})) for iid in all_ids}
+    return render_channels(all_ids, cfg)
 
 
 @app.get("/multiview-feed/{input_id:path}")

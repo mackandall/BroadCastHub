@@ -22,6 +22,7 @@ No plain-text passwords are ever written to disk.
 
 import os
 import json
+import html
 import secrets
 import logging
 import tempfile
@@ -32,7 +33,7 @@ from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from fastapi import Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-log = logging.getLogger("broadcast_hub.auth")
+log = logging.getLogger("m2tsweb_fastapi.auth")
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -146,6 +147,7 @@ def make_session_cookie(response: Response) -> None:
         max_age  = COOKIE_MAX_AGE,
         httponly = True,
         samesite = "lax",
+        secure   = False,   # Set to True if serving over HTTPS
     )
 
 
@@ -175,70 +177,142 @@ def _base_html(title: str, body: str) -> str:
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{title} — Broadcast Hub</title>
+<title>{html.escape(title)} — Broadcast Hub</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap" rel="stylesheet">
+<script>
+  (function(){{
+    try {{
+      var t = localStorage.getItem('bh-theme');
+      if (t && ['dark','mono','light'].includes(t))
+        document.documentElement.setAttribute('data-theme', t);
+    }} catch(e) {{}}
+  }})();
+</script>
 <style>
   *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+
+  :root, [data-theme="dark"] {{
+    --bg:      #090d1a;
+    --surface: #0b0f22;
+    --border:  #1c2540;
+    --text:    #c0cce8;
+    --muted:   #3a4870;
+    --accent:  #00e5ff;
+    --accent-dim: rgba(0,229,255,.18);
+    --accent-bdr: rgba(0,229,255,.4);
+    --input-bg: #060810;
+    --error-bg:  rgba(255,0,102,.1);
+    --error-bdr: rgba(255,0,102,.3);
+    --error-txt: #ff0066;
+    --success-bg:  rgba(0,229,160,.08);
+    --success-bdr: rgba(0,229,160,.2);
+    --success-txt: #00e5a0;
+    --label: #2a3560;
+    --hint:  #2a3560;
+    --back:  #2a3560;
+  }}
+  [data-theme="mono"] {{
+    --bg:      #100e06;
+    --surface: #0c0a04;
+    --border:  #2a1e08;
+    --text:    #e8d0a0;
+    --muted:   #5a3818;
+    --accent:  #ff6600;
+    --accent-dim: rgba(255,102,0,.18);
+    --accent-bdr: rgba(255,102,0,.45);
+    --input-bg: #070604;
+    --error-bg:  rgba(255,34,0,.1);
+    --error-bdr: rgba(255,34,0,.3);
+    --error-txt: #ff2200;
+    --success-bg:  rgba(136,204,0,.08);
+    --success-bdr: rgba(136,204,0,.2);
+    --success-txt: #88cc00;
+    --label: #3a2810;
+    --hint:  #3a2810;
+    --back:  #3a2810;
+  }}
+  [data-theme="light"] {{
+    --bg:      #f3f5fa;
+    --surface: #ffffff;
+    --border:  #c8cedd;
+    --text:    #1a1f38;
+    --muted:   #6878a8;
+    --accent:  #4d9fff;
+    --accent-dim: rgba(77,159,255,.15);
+    --accent-bdr: rgba(77,159,255,.45);
+    --input-bg: #f8f9fd;
+    --error-bg:  rgba(220,38,38,.07);
+    --error-bdr: rgba(220,38,38,.25);
+    --error-txt: #dc2626;
+    --success-bg:  rgba(5,150,105,.07);
+    --success-bdr: rgba(5,150,105,.2);
+    --success-txt: #059669;
+    --label: #b0b8d0;
+    --hint:  #b0b8d0;
+    --back:  #b0b8d0;
+  }}
+
   body {{
-    background: #080808; color: #f0f0f0;
+    background: var(--bg); color: var(--text);
     font-family: 'Inter', sans-serif;
     min-height: 100vh;
     display: flex; align-items: center; justify-content: center;
   }}
   .card {{
-    background: #0f0f0f; border: 1px solid #1e1e1e;
+    background: var(--surface); border: 1px solid var(--border);
     border-radius: 6px; padding: 36px 40px;
     width: 100%; max-width: 420px;
   }}
   .logo {{
     font-weight: 900; font-style: italic; font-size: 22px;
     text-transform: uppercase; margin-bottom: 28px; text-align: center;
+    color: var(--text);
   }}
-  .logo span {{ color: #e8ff47; }}
+  .logo span {{ color: var(--accent); }}
   h2 {{
     font-size: 13px; font-weight: 900; text-transform: uppercase;
-    letter-spacing: .12em; color: #555; margin-bottom: 24px; text-align: center;
+    letter-spacing: .12em; color: var(--muted); margin-bottom: 24px; text-align: center;
   }}
   .field {{ margin-bottom: 14px; }}
   label {{
     display: block; font-size: 10px; font-weight: 900;
     text-transform: uppercase; letter-spacing: .12em;
-    color: #3a3a3a; margin-bottom: 5px;
+    color: var(--label); margin-bottom: 5px;
   }}
   input[type=password], input[type=text] {{
-    width: 100%; background: #111; border: 1px solid #2a2a2a;
-    color: #f0f0f0; font-family: 'Inter', sans-serif;
+    width: 100%; background: var(--input-bg); border: 1px solid var(--border);
+    color: var(--text); font-family: 'Inter', sans-serif;
     font-size: 14px; padding: 11px 13px; border-radius: 4px; outline: none;
   }}
-  input:focus {{ border-color: #e8ff47; box-shadow: 0 0 0 2px rgba(232,255,71,.1); }}
+  input:focus {{ border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-dim); }}
   .hint {{
-    font-size: 11px; color: #3a3a3a; margin-top: 5px; line-height: 1.5;
+    font-size: 11px; color: var(--hint); margin-top: 5px; line-height: 1.5;
   }}
   .btn {{
     width: 100%; margin-top: 20px; padding: 13px;
     font-family: 'Inter', sans-serif; font-weight: 900; font-size: 13px;
     text-transform: uppercase; letter-spacing: .08em;
-    background: #e8ff47; color: #000;
+    background: var(--accent); color: var(--bg);
     border: none; border-radius: 4px; cursor: pointer;
     transition: opacity .15s;
   }}
   .btn:hover {{ opacity: .88; }}
   .error {{
-    background: rgba(255,59,59,.1); border: 1px solid rgba(255,59,59,.3);
-    color: #ff6b6b; font-size: 12px; padding: 10px 13px;
+    background: var(--error-bg); border: 1px solid var(--error-bdr);
+    color: var(--error-txt); font-size: 12px; padding: 10px 13px;
     border-radius: 4px; margin-bottom: 16px; line-height: 1.5;
   }}
   .success {{
-    background: rgba(100,220,80,.08); border: 1px solid rgba(100,220,80,.2);
-    color: #64dc50; font-size: 12px; padding: 10px 13px;
+    background: var(--success-bg); border: 1px solid var(--success-bdr);
+    color: var(--success-txt); font-size: 12px; padding: 10px 13px;
     border-radius: 4px; margin-bottom: 16px; line-height: 1.5;
   }}
   .back {{
     display: block; text-align: center; margin-top: 18px;
-    font-size: 11px; color: #333; text-decoration: none;
+    font-size: 11px; color: var(--back); text-decoration: none;
     text-transform: uppercase; letter-spacing: .1em;
   }}
-  .back:hover {{ color: #666; }}
+  .back:hover {{ color: var(--muted); }}
 </style>
 </head>
 <body>
@@ -251,7 +325,7 @@ def _base_html(title: str, body: str) -> str:
 
 
 def setup_page(error: str = "") -> HTMLResponse:
-    err_html = f'<div class="error">{error}</div>' if error else ""
+    err_html = f'<div class="error">{html.escape(error)}</div>' if error else ""
     body = f"""
     <h2>First-Time Setup</h2>
     {err_html}
@@ -271,12 +345,13 @@ def setup_page(error: str = "") -> HTMLResponse:
 
 
 def login_page(error: str = "", next_url: str = "/") -> HTMLResponse:
-    err_html = f'<div class="error">{error}</div>' if error else ""
+    err_html = f'<div class="error">{html.escape(error)}</div>' if error else ""
+    safe_next = html.escape(next_url)
     body = f"""
     <h2>Sign In</h2>
     {err_html}
     <form method="post" action="/login">
-      <input type="hidden" name="next" value="{next_url}">
+      <input type="hidden" name="next" value="{safe_next}">
       <div class="field">
         <label>Password</label>
         <input type="password" name="password" autofocus autocomplete="current-password" required>
@@ -291,7 +366,7 @@ def change_password_page(error: str = "", success: bool = False) -> HTMLResponse
     if success:
         msg_html = '<div class="success">Password changed. You have been signed out of all other sessions.</div>'
     elif error:
-        msg_html = f'<div class="error">{error}</div>'
+        msg_html = f'<div class="error">{html.escape(error)}</div>'
     body = f"""
     <h2>Change Password</h2>
     {msg_html}
