@@ -4080,6 +4080,7 @@ async def channels_save(
     content_id:   str = Form(""),
     settle_time_secs: int = Form(20),
     enabled:      bool = Form(True),
+    guide_station_id: str = Form(""),
 ):
     # NOTE: no input_id field — channels are no longer tied to a fixed
     # input. Which physical device serves a given channel request is
@@ -4102,6 +4103,11 @@ async def channels_save(
             "content_id":       content_id.strip(),
             "settle_time_secs": max(5, min(settle_time_secs, 120)),
             "enabled":          enabled,
+            # Gracenote station id for the guide, exported as tvc-guide-stationid
+            # (digits only). Lets Channels DVR use any station, not just ones in
+            # its configured lineups — e.g. a DirecTV free channel whose own
+            # listing isn't offered in Channels' mapping screen.
+            "guide_station_id": re.sub(r"\D", "", guide_station_id or ""),
         }
         _save_channels_config(channels_config)
     return JSONResponse({"ok": True})
@@ -4146,8 +4152,8 @@ def _parse_m3u_channels(m3u_text: str, default_provider: str) -> list:
 
     Returns a list of channel dicts ready to save. Deliberately tolerant
     of the exact #EXTINF attribute set (only channel-number is actually
-    used; other attributes like tvc-guide-stationid are ignored here,
-    since we don't yet have a use for them) and of either http(s):// or
+    used, plus tvc-guide-stationid which is kept as guide_station_id and
+    exported again) and of either http(s):// or
     a bare path in the URL line, so real-world M3U exports — which may or
     may not have had their {{ .IPADDRESS }} template substituted — both
     parse correctly, regardless of which of the two URL styles is used.
@@ -4161,6 +4167,8 @@ def _parse_m3u_channels(m3u_text: str, default_provider: str) -> list:
             # Extract channel-number="N" if present
             m_num = re.search(r'channel-number="([^"]*)"', line)
             guide_number = m_num.group(1) if m_num else ""
+            m_station = re.search(r'tvc-guide-stationid="(\d+)"', line)
+            guide_station_id = m_station.group(1) if m_station else ""
             # Display name is everything after the last comma on this line
             display_name = line.rsplit(",", 1)[-1].strip() if "," in line else ""
 
@@ -4183,6 +4191,7 @@ def _parse_m3u_channels(m3u_text: str, default_provider: str) -> list:
                         "content_id":       content_id,
                         "settle_time_secs": 20,
                         "enabled":          True,
+                        "guide_station_id": guide_station_id,
                     })
                 else:
                     # Format 2 fallback: no tilde anywhere in the URL —
@@ -4203,6 +4212,7 @@ def _parse_m3u_channels(m3u_text: str, default_provider: str) -> list:
                             "content_id":       "",
                             "settle_time_secs": 20,
                             "enabled":          True,
+                            "guide_station_id": guide_station_id,
                         })
                 i += 2
                 continue
@@ -4586,7 +4596,9 @@ async def channels_export_m3u(request: Request):
             continue
         guide_number = ch.get("guide_number", "")
         display_name = ch.get("display_name", channel_id)
-        lines.append(f'#EXTINF:-1 channel-number="{guide_number}",{display_name}')
+        station = ch.get("guide_station_id", "")
+        station_attr = f' tvc-guide-stationid="{station}"' if station else ""
+        lines.append(f'#EXTINF:-1 channel-number="{guide_number}"{station_attr},{display_name}')
         lines.append(f'{base}/channel/{channel_id}/stream')
     body = "\n".join(lines) + "\n"
     return Response(content=body, media_type="audio/x-mpegurl")

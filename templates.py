@@ -1319,6 +1319,8 @@ def render_channels(all_ids: list, cfg: dict) -> str:
       <input class="dl-input" id="ce-display-name" type="text" placeholder="TNT HD">
       <label class="dl-lbl">Guide Number</label>
       <input class="dl-input" id="ce-guide-number" type="text" placeholder="13.1">
+      <label class="dl-lbl">Guide Station ID (optional)</label>
+      <input class="dl-input" id="ce-guide-station" type="text" inputmode="numeric" placeholder="Gracenote station id, e.g. 158131">
       <label class="dl-lbl">Provider</label>
       <select class="dl-input" id="ce-provider"></select>
       <label class="dl-lbl">Call Sign</label>
@@ -1572,6 +1574,7 @@ def render_channels(all_ids: list, cfg: dict) -> str:
     document.getElementById('ce-channel-id').disabled = !!ch;
     document.getElementById('ce-display-name').value  = ch ? ch.display_name : '';
     document.getElementById('ce-guide-number').value  = ch ? ch.guide_number : '';
+    document.getElementById('ce-guide-station').value = ch ? (ch.guide_station_id || '') : '';
     document.getElementById('ce-provider').value      = ch ? ch.provider : '';
     document.getElementById('ce-callsign').value      = ch ? ch.callsign : '';
     document.getElementById('ce-content-id').value    = ch ? ch.content_id : '';
@@ -1592,6 +1595,7 @@ def render_channels(all_ids: list, cfg: dict) -> str:
     fd.append('channel_id',        channelId);
     fd.append('display_name',      document.getElementById('ce-display-name').value.trim());
     fd.append('guide_number',      document.getElementById('ce-guide-number').value.trim());
+    fd.append('guide_station_id',  document.getElementById('ce-guide-station').value.trim());
     fd.append('provider',          document.getElementById('ce-provider').value);
     fd.append('callsign',          document.getElementById('ce-callsign').value.trim());
     fd.append('content_id',        document.getElementById('ce-content-id').value.trim());
