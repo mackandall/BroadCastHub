@@ -8,6 +8,7 @@ Called from the route handlers in broadcast_hub.py after they have gathered
 state from the shared dicts/locks.
 """
 
+import html
 import json
 import time
 
@@ -948,7 +949,7 @@ def render_channels(all_ids: list, cfg: dict) -> str:
           </select>
           <input class="dl-input device-remote-ip" type="text" style="flex:1"
             placeholder="Device IP (e.g. 192.168.1.130)"
-            value="{cfg.get(iid, {}).get('remote_ip', '')}"
+            value="{html.escape(cfg.get(iid, {}).get('remote_ip', ''), quote=True)}"
             {"disabled" if cfg.get(iid, {}).get("remote_type", "none") == "none" else ""}>
           <button class="btn q-btn" style="font-size:10px;padding:5px 10px" onclick="saveDeviceRemote('{iid}')">Save</button>
           <span class="device-row-status" id="device-status-{iid}"></span>
@@ -3067,6 +3068,19 @@ def render_dashboard(
       if (inp && !inp.value) inp.value = data.installer_path;
     }}
 
+    // ── ADB unauthorized banner ──
+    const adbBanner = document.getElementById('adb-banner');
+    if (adbBanner) {{
+      const bad = data.adb_unauthorized || [];
+      adbBanner.classList.toggle('show', bad.length > 0);
+      if (bad.length) {{
+        const txt = document.getElementById('adb-banner-text');
+        const list = bad.map(b => `${{b.label}} (${{b.ip}}, ${{b.state}})`).join(', ');
+        txt.innerHTML = `${{bad.length}} box${{bad.length > 1 ? 'es' : ''}} need${{bad.length > 1 ? '' : 's'}} ADB re-authorization` +
+          `<span> — re-approve "Allow USB debugging" on-screen: ${{list}}</span>`;
+      }}
+    }}
+
     const ind=document.getElementById('sse-indicator');
     if(ind){{ ind.style.opacity='1'; clearTimeout(ind._t); ind._t=setTimeout(()=>ind.style.opacity='.3',3000); }}
 
@@ -4127,6 +4141,12 @@ def render_dashboard(
     <span>— this usually happens after a kernel update.</span>
   </div>
   <button class="btn-driver-fix" onclick="openDriverModal()">Reinstall Driver</button>
+</div>
+
+<!-- ADB unauthorized banner (shown by JS when SSE reports adb_unauthorized entries) -->
+<div class="driver-banner" id="adb-banner">
+  <div class="driver-banner-icon">⚠</div>
+  <div class="driver-banner-text" id="adb-banner-text"></div>
 </div>
 
 <div class="page">

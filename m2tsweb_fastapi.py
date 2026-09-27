@@ -1,5 +1,7 @@
 import os, asyncio, subprocess, json, shutil, psutil, uuid, time, re, sys, termios, tempfile, fcntl, socket, struct
 import logging
+import smtplib
+from email.mime.text import MIMEText
 import auth as _auth
 from datetime import datetime
 from fastapi import FastAPI, Request, Response, Form
@@ -105,6 +107,18 @@ def _safe_output_path(path: str) -> str:
 
 _VAAPI_DEVICE_RE = re.compile(r"^[a-zA-Z0-9/_\-\.]+$")
 _FFMPEG_FILTER_BANNED = re.compile(r"[;&|`$<>]")  # shell-injection characters
+
+# Remote-device host: an IPv4 address or hostname only — no path/query
+# separators, quotes, or HTML/shell metacharacters. This value gets stored
+# and re-rendered into an HTML attribute (Channels page) and interpolated
+# into an `adb -s <host>` argument and a Roku ECP URL, so restricting the
+# charset at write time closes stored-XSS and URL-manipulation in one place
+# rather than relying only on escaping every place it's later used.
+_REMOTE_HOST_RE = re.compile(r"^[A-Za-z0-9.\-]+$")
+
+
+def _valid_remote_host(host: str) -> bool:
+    return host == "" or bool(_REMOTE_HOST_RE.match(host))
 
 def _safe_vaapi_device(device: str) -> str:
     """Allow only valid DRM render node paths, e.g. renderD128."""
@@ -647,6 +661,7 @@ def _sort_ids(ids):
 CONFIG_FILE     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "input_config.json")
 FAN_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fan_config.json")
 CHANNELS_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "channels.json")
+ALERT_CONFIG_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alert_config.json")
 STREAM_SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stream_settings.json")
 
 # ---------------------------------------------------------------------------
@@ -1200,12 +1215,30 @@ async def _try_tune_device(input_id: str, remote_ip: str, channel_id: str, ch: d
                 am_args.append(package)
             result = await _adb_shell(remote_ip, am_args, timeout=15)
             t_start = time.time()
+            launch_stdout = result.stdout.strip()
+            launch_stderr = result.stderr.strip()
             log.info(
                 "Tune step [am-start] input=%s remote_ip=%s took=%.2fs returncode=%s\n"
                 "  uri=%s\n  stdout=%r\n  stderr=%r",
                 input_id, remote_ip, t_start - t_stop, result.returncode,
-                uri, result.stdout.strip(), result.stderr.strip(),
+                uri, launch_stdout, launch_stderr,
             )
+            # CONFIRMED BUG, fixed here: `am start` returns exit code 0
+            # even when it fails to resolve the target (e.g. "Error type
+            # 3\nError: Activity class {pkg/Activity} does not exist." —
+            # seen live during testing with a provider whose app wasn't
+            # installed on the device a pool candidate happened to be).
+            # Only returncode was checked before, so this fell through to
+            # the readiness gate, which can report a false "ready" from
+            # some other app's stale audio/media session already running
+            # on that box — meaning a failed tune could get accepted,
+            # capture the wrong device's HDMI feed, and never try the
+            # next candidate in the pool. `am`'s own error text always
+            # starts with "Error" — a successful launch's stdout/stderr
+            # never contains it — so this is caught explicitly and failed
+            # over immediately.
+            if "Error" in launch_stdout or "Error" in launch_stderr:
+                return {"ok": False, "error": f"am start failed on {remote_ip}: {launch_stderr or launch_stdout}"}
     except Exception as exc:
         log.warning("Tune step FAILED on input=%s remote_ip=%s after %.2fs: %s",
                      input_id, remote_ip, time.time() - t0, exc)
@@ -1992,23 +2025,29 @@ def _check_disk_space(path: str) -> tuple[bool, int]:
 # ---------------------------------------------------------------------------
 async def update_stats_loop():
     while True:
-        async with inputs_lock:
-            snapshot = {i: v["p_obj"] for i, v in active_inputs.items()}
+        try:
+            async with inputs_lock:
+                snapshot = {i: v["p_obj"] for i, v in active_inputs.items()}
 
-        new_stats = {}
-        for i, p_obj in snapshot.items():
-            try:
-                new_stats[i] = {
-                    "cpu": p_obj.cpu_percent(interval=None) / CPU_COUNT,
-                    "mem": p_obj.memory_info().rss / (1024 * 1024),
-                }
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
+            new_stats = {}
+            for i, p_obj in snapshot.items():
+                try:
+                    new_stats[i] = {
+                        "cpu": p_obj.cpu_percent(interval=None) / CPU_COUNT,
+                        "mem": p_obj.memory_info().rss / (1024 * 1024),
+                    }
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
 
-        async with inputs_lock:
-            for i, stats in new_stats.items():
-                if i in active_inputs:
-                    active_inputs[i]["stats"] = stats
+            async with inputs_lock:
+                for i, stats in new_stats.items():
+                    if i in active_inputs:
+                        active_inputs[i]["stats"] = stats
+        except Exception:
+            # Never let a transient error (e.g. a torn read of active_inputs)
+            # permanently kill this loop — stats would silently stop updating
+            # for the rest of the process's life with no visible error.
+            log.exception("update_stats_loop: iteration failed, continuing")
 
         await asyncio.sleep(2)
 
@@ -2016,69 +2055,224 @@ async def update_stats_loop():
 async def watchdog_loop():
     while True:
         await asyncio.sleep(3)
+        try:
+            await _watchdog_iteration()
+        except Exception:
+            # An uncaught exception here would otherwise kill this task
+            # permanently — leaked tuners would never get swept and dead
+            # inputs would never respawn again, with nothing logged.
+            log.exception("watchdog_loop: iteration failed, continuing")
 
-        # Sweep for a real, confirmed edge case: if a client disconnects in
-        # the narrow window while _select_and_tune_channel is still in
-        # flight (after a tuner is claimed/marked active, but before the
-        # channel_stream generator resumes to register a real viewer via
-        # _ensure_input), the tuner can be left permanently marked "active"
-        # with no active_inputs entry ever created for it, and nothing else
-        # will ever release it. Confirmed happening in practice via the
-        # warning logged at the cancellation site — this sweep is the
-        # proper fix that was deferred until it was seen occurring.
-        # Grace period is generous (20s) to comfortably clear normal
-        # tune+_ensure_input timing (which can itself take 10-13s) without
-        # racing a legitimately-still-tuning request.
-        now_sweep = time.time()
-        for input_id, state in list(input_tuning_state.items()):
-            if not state.get("active"):
+
+async def _watchdog_iteration():
+    # Sweep for a real, confirmed edge case: if a client disconnects in
+    # the narrow window while _select_and_tune_channel is still in
+    # flight (after a tuner is claimed/marked active, but before the
+    # channel_stream generator resumes to register a real viewer via
+    # _ensure_input), the tuner can be left permanently marked "active"
+    # with no active_inputs entry ever created for it, and nothing else
+    # will ever release it. Confirmed happening in practice via the
+    # warning logged at the cancellation site — this sweep is the
+    # proper fix that was deferred until it was seen occurring.
+    # Grace period is generous (20s) to comfortably clear normal
+    # tune+_ensure_input timing (which can itself take 10-13s) without
+    # racing a legitimately-still-tuning request.
+    now_sweep = time.time()
+    for input_id, state in list(input_tuning_state.items()):
+        if not state.get("active"):
+            continue
+        if input_id in active_inputs:
+            continue   # has a real capture/viewer behind it, not stuck
+        tuned_at = state.get("tuned_at", 0)
+        if now_sweep - tuned_at > 20:
+            log.warning(
+                "Watchdog: input %s has been marked active for %.0fs with "
+                "no active_inputs entry — likely a tuner leaked from a "
+                "cancelled-mid-tune request; releasing it",
+                input_id, now_sweep - tuned_at,
+            )
+            asyncio.create_task(_release_tuner(input_id))
+
+    to_respawn = []
+    now = time.time()
+
+    async with inputs_lock:
+        for input_id, watch in list(SHOULD_BE_LIVE.items()):
+            if watch.get("faulted"):
                 continue
             if input_id in active_inputs:
-                continue   # has a real capture/viewer behind it, not stuck
-            tuned_at = state.get("tuned_at", 0)
-            if now_sweep - tuned_at > 20:
-                log.warning(
-                    "Watchdog: input %s has been marked active for %.0fs with "
-                    "no active_inputs entry — likely a tuner leaked from a "
-                    "cancelled-mid-tune request; releasing it",
-                    input_id, now_sweep - tuned_at,
-                )
-                asyncio.create_task(_release_tuner(input_id))
+                continue
 
-        to_respawn = []
-        now = time.time()
+            restart_count = watch.get("restart_count", 0)
+            last_restart  = watch.get("last_restart", 0)
 
+            if now - last_restart > WATCHDOG_WINDOW * 2:
+                restart_count = 0
+                SHOULD_BE_LIVE[input_id]["restart_count"] = 0
+
+            if restart_count >= WATCHDOG_MAX_RESTARTS:
+                log.error("Watchdog: %s faulted after %d restarts — giving up", input_id, restart_count)
+                SHOULD_BE_LIVE[input_id]["faulted"] = True
+                continue
+
+            backoff = WATCHDOG_BACKOFF[min(restart_count, len(WATCHDOG_BACKOFF) - 1)]
+            if now - last_restart < backoff:
+                continue
+
+            to_respawn.append(input_id)
+
+    for input_id in to_respawn:
+        log.warning("Watchdog: respawning %s (attempt %d)", input_id, SHOULD_BE_LIVE[input_id]['restart_count'] + 1)
         async with inputs_lock:
-            for input_id, watch in list(SHOULD_BE_LIVE.items()):
-                if watch.get("faulted"):
-                    continue
-                if input_id in active_inputs:
-                    continue
+            SHOULD_BE_LIVE[input_id]["restart_count"] = SHOULD_BE_LIVE[input_id].get("restart_count", 0) + 1
+            SHOULD_BE_LIVE[input_id]["last_restart"]  = time.time()
+            await _ensure_input(input_id)
 
-                restart_count = watch.get("restart_count", 0)
-                last_restart  = watch.get("last_restart", 0)
+# ---------------------------------------------------------------------------
+# ADB authorization monitor
+#
+# CONFIRMED via a live incident: an Android TV box's "Always allow from
+# this computer" ADB trust does not survive this host rebooting (seen on
+# an AT&T TV / c71kw400 box — a locked "user" build with no root and no
+# OEM-unlock path, so this can't be fixed by writing the key into the
+# device's persisted trust store; re-approving on-screen is the only way
+# to clear it). Every tune attempt against a device in this state fails
+# fast with "unauthorized" and there was previously no signal of this
+# until a recording silently produced nothing. This loop polls `adb
+# devices` for every input configured with remote_type "adb" and surfaces
+# a dashboard banner + one-shot email the moment a device NEWLY drops out
+# of the "device" (trusted) state, so it can be re-approved before it
+# costs a recording instead of after.
+# ---------------------------------------------------------------------------
+ADB_UNAUTHORIZED: dict = {}   # input_id -> {"label": str, "ip": str, "state": str}
+ADB_AUTH_POLL_SECS = 120
 
-                if now - last_restart > WATCHDOG_WINDOW * 2:
-                    restart_count = 0
-                    SHOULD_BE_LIVE[input_id]["restart_count"] = 0
 
-                if restart_count >= WATCHDOG_MAX_RESTARTS:
-                    log.error("Watchdog: %s faulted after %d restarts — giving up", input_id, restart_count)
-                    SHOULD_BE_LIVE[input_id]["faulted"] = True
-                    continue
+def _load_alert_config() -> dict:
+    try:
+        with open(ALERT_CONFIG_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
 
-                backoff = WATCHDOG_BACKOFF[min(restart_count, len(WATCHDOG_BACKOFF) - 1)]
-                if now - last_restart < backoff:
-                    continue
 
-                to_respawn.append(input_id)
+def _send_email_alert_sync(cfg: dict, subject: str, body: str) -> None:
+    server_spec = cfg.get("smtp_server", "")
+    email_from  = cfg.get("email_from", "")
+    email_pass  = cfg.get("email_password", "")
+    email_to    = cfg.get("email_to", "")
+    if not (server_spec and email_from and email_pass and email_to):
+        log.warning("ADB alert: email not configured (fill in %s) — skipping email, banner still applies", ALERT_CONFIG_FILE)
+        return
 
-        for input_id in to_respawn:
-            log.warning("Watchdog: respawning %s (attempt %d)", input_id, SHOULD_BE_LIVE[input_id]['restart_count'] + 1)
-            async with inputs_lock:
-                SHOULD_BE_LIVE[input_id]["restart_count"] = SHOULD_BE_LIVE[input_id].get("restart_count", 0) + 1
-                SHOULD_BE_LIVE[input_id]["last_restart"]  = time.time()
-                await _ensure_input(input_id)
+    host, _, port = server_spec.partition(":")
+    port = int(port) if port else 587
+
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"]    = email_from
+    msg["To"]      = email_to
+
+    try:
+        with smtplib.SMTP(host, port, timeout=15) as smtp:
+            smtp.starttls()
+            smtp.login(email_from, email_pass)
+            smtp.sendmail(email_from, [email_to], msg.as_string())
+        log.info("ADB alert: email sent to %s (%s)", email_to, subject)
+    except Exception as exc:
+        log.error("ADB alert: failed to send email: %s", exc)
+
+
+async def _send_email_alert(subject: str, body: str) -> None:
+    cfg = _load_alert_config()
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _send_email_alert_sync, cfg, subject, body)
+
+
+def _parse_adb_devices(raw: str) -> dict:
+    """Maps 'ip:5555' -> state ('device'/'unauthorized'/'offline'/...) from
+    `adb devices -l` output. A device with no line at all (never connected
+    this session) is treated the same as "unauthorized" by the caller."""
+    states = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("List of devices"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        serial, state = parts[0], parts[1]
+        ip = serial.split(":", 1)[0]
+        states[ip] = state
+    return states
+
+
+async def adb_auth_monitor_loop():
+    global ADB_UNAUTHORIZED
+    loop = asyncio.get_running_loop()
+    while True:
+        await asyncio.sleep(ADB_AUTH_POLL_SECS)
+        try:
+            async with input_config_lock:
+                adb_inputs = {
+                    input_id: cfg.get("remote_ip", cfg.get("adb_ip", "")).strip()
+                    for input_id, cfg in input_config.items()
+                    if cfg.get("remote_type", "adb" if cfg.get("adb_ip") else "none") == "adb"
+                    and cfg.get("remote_ip", cfg.get("adb_ip", "")).strip()
+                }
+            if not adb_inputs:
+                continue
+
+            result = await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(["adb", "devices", "-l"], capture_output=True, text=True, timeout=10),
+            )
+            device_states = _parse_adb_devices(result.stdout)
+
+            newly_bad = {}
+            still_bad = {}
+            for input_id, ip in adb_inputs.items():
+                state = device_states.get(ip, "missing")
+                if state != "device":
+                    entry = {"label": _label(input_id), "ip": ip, "state": state}
+                    still_bad[input_id] = entry
+                    if input_id not in ADB_UNAUTHORIZED:
+                        newly_bad[input_id] = entry
+
+            recovered = [
+                ADB_UNAUTHORIZED[input_id]
+                for input_id in ADB_UNAUTHORIZED
+                if input_id not in still_bad
+            ]
+
+            ADB_UNAUTHORIZED = still_bad
+
+            for input_id, entry in newly_bad.items():
+                log.warning(
+                    "ADB auth monitor: %s (%s) is now '%s' — dashboard banner raised, alerting",
+                    entry["label"], entry["ip"], entry["state"],
+                )
+            if newly_bad:
+                lines = [f"{e['label']} ({e['ip']}): {e['state']}" for e in newly_bad.values()]
+                await _send_email_alert(
+                    f"BroadcastHub: {len(newly_bad)} ADB device(s) need re-authorization",
+                    "The following boxes dropped out of the trusted ADB state and need "
+                    "the on-screen \"Allow USB debugging\" prompt re-approved before they "
+                    "can be tuned or recorded from:\n\n" + "\n".join(lines),
+                )
+
+            for entry in recovered:
+                log.info("ADB auth monitor: %s (%s) is authorized again", entry["label"], entry["ip"])
+            if recovered:
+                lines = [f"{e['label']} ({e['ip']})" for e in recovered]
+                await _send_email_alert(
+                    f"BroadcastHub: {len(recovered)} ADB device(s) recovered",
+                    "The following boxes are trusted again and no longer need attention:\n\n"
+                    + "\n".join(lines),
+                )
+        except Exception as exc:
+            log.warning("ADB auth monitor: poll failed (non-fatal): %s", exc)
+
 
 # ---------------------------------------------------------------------------
 # HLS writer
@@ -2527,6 +2721,7 @@ async def lifespan(app: FastAPI):
     fan_task      = asyncio.create_task(fan_manager_loop())
     edid_task     = asyncio.create_task(edid_refresh_loop())
     stray_task    = asyncio.create_task(stray_device_sleep_loop())
+    adb_auth_task = asyncio.create_task(adb_auth_monitor_loop())
 
     # UPnP/DLNA SSDP — best-effort; a failure here (e.g. port 1900 already
     # in use by another SSDP responder on this machine) is logged but
@@ -2543,6 +2738,7 @@ async def lifespan(app: FastAPI):
         fan_task.cancel()
         edid_task.cancel()
         stray_task.cancel()
+        adb_auth_task.cancel()
         ssdp_announce_task.cancel()
         for hb_input_id in list(input_heartbeat_tasks.keys()):
             _cancel_heartbeat(hb_input_id)
@@ -2715,6 +2911,26 @@ async def distributor(input_id, process):
                         active_inputs[input_id]["viewers"]      = live
                         active_inputs[input_id]["viewer_count"] = len(live)
                         for v in evicted:
+                            # CONFIRMED GAP, closed here: this used to only
+                            # remove the viewer from the list, exactly the
+                            # same bug _release_same_client_viewers had
+                            # before its own fix — the generator serving
+                            # this viewer was never actually woken, just
+                            # silently orphaned. A real case showed one
+                            # sitting alive for nearly 5 minutes (almost
+                            # certainly a half-dead TCP connection the OS
+                            # never reported as closed) before Python's own
+                            # garbage collection finally destroyed its
+                            # pending stop_event.wait() task and let its
+                            # finally block run — harmless that one time
+                            # only because nothing had reused the input in
+                            # the meantime, but a real race the same way
+                            # the earlier eviction bug was. Signaling here
+                            # wakes the generator immediately instead of
+                            # leaving it to resolve on its own schedule.
+                            stop_event = v.get("stop_event")
+                            if stop_event is not None:
+                                stop_event.set()
                             log.warning(
                                 "Distributor: evicted stale viewer %s from %s "
                                 "(no data consumed for %.0fs)",
@@ -2840,8 +3056,20 @@ async def recording_worker(record_id: str, input_id: str, output_path: str,
         start_new_session=True,   # own process group, consistent with other ffmpeg launches
     )
     async with records_lock:
-        if record_id in active_records:
-            active_records[record_id]["process"] = proc
+        entry = active_records.get(record_id)
+        if entry is None or entry.get("cancelled"):
+            # /record/stop already ran while we were still spawning ffmpeg
+            # (the entry was created with process=None before this Popen
+            # call returned). Don't let this process run unregistered and
+            # unstoppable — kill it now instead of registering it.
+            active_records.pop(record_id, None)
+            cancelled = True
+        else:
+            entry["process"] = proc
+            cancelled = False
+    if cancelled:
+        await _kill_and_reap(proc, label=f"recording {record_id} (cancelled before start)")
+        return
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, proc.wait)
     async with records_lock:
@@ -2902,32 +3130,38 @@ async def recording_worker(record_id: str, input_id: str, output_path: str,
 # ---------------------------------------------------------------------------
 async def schedule_runner():
     while True:
-        now = time.time()
-        async with schedule_lock:
-            for job_id in list(scheduled_jobs.keys()):
-                job = scheduled_jobs[job_id]
-                if job["start_ts"] <= now:
-                    if now - job["start_ts"] > 60:
+        try:
+            now = time.time()
+            async with schedule_lock:
+                for job_id in list(scheduled_jobs.keys()):
+                    job = scheduled_jobs[job_id]
+                    if job["start_ts"] <= now:
+                        if now - job["start_ts"] > 60:
+                            del scheduled_jobs[job_id]
+                            continue
+                        record_id = str(uuid.uuid4())[:8]
+                        async with records_lock:
+                            active_records[record_id] = {
+                                "input_id":    job["input_id"],
+                                "output_path": job["output_path"],
+                                "fmt":         job["fmt"],
+                                "duration":    job["duration"],
+                                "started_at":  time.time(),
+                                "process":     None,
+                                "label":       job.get("label", ""),
+                            }
+                        asyncio.create_task(
+                            recording_worker(record_id, job["input_id"],
+                                             job["output_path"], job["fmt"],
+                                             job["duration"],
+                                             job.get("adb_home", False))
+                        )
                         del scheduled_jobs[job_id]
-                        continue
-                    record_id = str(uuid.uuid4())[:8]
-                    async with records_lock:
-                        active_records[record_id] = {
-                            "input_id":    job["input_id"],
-                            "output_path": job["output_path"],
-                            "fmt":         job["fmt"],
-                            "duration":    job["duration"],
-                            "started_at":  time.time(),
-                            "process":     None,
-                            "label":       job.get("label", ""),
-                        }
-                    asyncio.create_task(
-                        recording_worker(record_id, job["input_id"],
-                                         job["output_path"], job["fmt"],
-                                         job["duration"],
-                                         job.get("adb_home", False))
-                    )
-                    del scheduled_jobs[job_id]
+        except Exception:
+            # A single bad iteration must not permanently kill this loop —
+            # every scheduled recording after that point would silently
+            # never fire again for the rest of the process's life.
+            log.exception("schedule_runner: iteration failed, continuing")
         await asyncio.sleep(5)
 
 # ---------------------------------------------------------------------------
@@ -3442,6 +3676,8 @@ async def set_remote(
     remote_ip   = remote_ip.strip()
     if remote_type not in ("none", "adb", "roku"):
         return JSONResponse({"ok": False, "error": "remote_type must be none, adb, or roku"}, status_code=400)
+    if not _valid_remote_host(remote_ip):
+        return JSONResponse({"ok": False, "error": "remote_ip must be a plain IP address or hostname"}, status_code=400)
 
     async with input_config_lock:
         if input_id not in INPUT_IDS:
@@ -3503,6 +3739,8 @@ async def set_remote(
 @app.post("/input/{input_id:path}/set_adb_ip")
 async def set_adb_ip(input_id: str, adb_ip: str = Form(...)):
     adb_ip = adb_ip.strip()
+    if not _valid_remote_host(adb_ip):
+        return JSONResponse({"ok": False, "error": "adb_ip must be a plain IP address or hostname"}, status_code=400)
     async with input_config_lock:
         if input_id not in INPUT_IDS:
             return JSONResponse({"ok": False, "error": "Input not found"}, status_code=404)
@@ -3890,23 +4128,6 @@ async def restore_input(input_id: str):
         log.info("Restored hidden input: %s", input_id)
     return JSONResponse({"ok": True})
 
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# Route — restore a hidden input
-# ---------------------------------------------------------------------------
-@app.post("/input/{input_id:path}/restore")
-async def restore_input(input_id: str):
-    """Remove an input from the hidden set, making it visible on the dashboard again."""
-    async with input_config_lock:
-        if input_id not in HIDDEN_IDS:
-            return JSONResponse({"ok": False, "error": f"{input_id} is not hidden"}, status_code=400)
-        HIDDEN_IDS.discard(input_id)
-        # Ensure the input is in INPUT_IDS so it appears on the dashboard
-        if input_id not in INPUT_IDS:
-            INPUT_IDS.append(input_id)
-        _save_config(input_config, INPUT_IDS, HIDDEN_IDS)
-        log.info("Restored hidden input: %s", input_id)
-    return JSONResponse({"ok": True})
 # ---------------------------------------------------------------------------
 # Routes — CoolerControl integration
 # ---------------------------------------------------------------------------
@@ -5372,6 +5593,7 @@ async def stats_sse(request: Request):
                     "input_ids":          ids_snapshot,
                     "meta":               meta_snapshot,
                     "driver_missing":     DRIVER_MISSING,
+                    "adb_unauthorized":   list(ADB_UNAUTHORIZED.values()),
                     "installer_path":     _get_installer_path(),
                     "available_encoders": [
                         {"value": e, "label": ENCODER_LABELS.get(e, e)}
@@ -5396,10 +5618,34 @@ async def stats_sse(request: Request):
 # ---------------------------------------------------------------------------
 # Routes — HLS
 # ---------------------------------------------------------------------------
+def _safe_hls_path(input_id: str, filename: str) -> str | None:
+    """Resolve an HLS file path and confirm it stays inside HLS_DIR.
+
+    input_id/segment come from unauthenticated `:path`/path-segment route
+    params, so a value containing '..' must not be allowed to resolve
+    outside the HLS directory tree. Returns None if it would escape.
+    """
+    root = os.path.realpath(HLS_DIR)
+    resolved = os.path.realpath(os.path.join(root, input_id, filename))
+    if resolved != root and not resolved.startswith(root + os.sep):
+        return None
+    return resolved
+
+
 @app.get("/hls/{input_id:path}/index.m3u8")
 async def hls_playlist(input_id: str, request: Request):
+    if input_id not in INPUT_IDS:
+        # /hls/ is unauthenticated (DLNA/VLC clients can't log in), and
+        # ensure_hls()/hls_writer() build a directory path and later
+        # shutil.rmtree() it straight from this input_id with no other
+        # check — an unvalidated value like "../../etc" must never reach
+        # that code at all, not just be caught by a path-containment check
+        # afterward.
+        return Response(status_code=404)
     await ensure_hls(input_id)
-    playlist_path = os.path.join(HLS_DIR, input_id, "index.m3u8")
+    playlist_path = _safe_hls_path(input_id, "index.m3u8")
+    if playlist_path is None:
+        return Response(status_code=400)
     for _ in range(20):
         if os.path.exists(playlist_path):
             break
@@ -5422,9 +5668,11 @@ async def hls_playlist(input_id: str, request: Request):
 
 @app.get("/hls/{input_id:path}/{segment}")
 async def hls_segment(input_id: str, segment: str):
-    if not segment.endswith(".ts"):
+    if input_id not in INPUT_IDS or not segment.endswith(".ts"):
         return Response(status_code=400)
-    seg_path = os.path.join(HLS_DIR, input_id, segment)
+    seg_path = _safe_hls_path(input_id, segment)
+    if seg_path is None:
+        return Response(status_code=400)
     if not os.path.exists(seg_path):
         return Response(status_code=404)
     with open(seg_path, "rb") as f:
@@ -5562,11 +5810,21 @@ async def record_start(
 
 @app.post("/record/stop/{record_id}")
 async def record_stop(record_id: str):
+    proc = None
     async with records_lock:
-        if record_id in active_records:
-            try: active_records[record_id]["process"].kill()
-            except Exception: pass
-            del active_records[record_id]
+        entry = active_records.get(record_id)
+        if entry is not None:
+            proc = entry.get("process")
+            if proc is None:
+                # ffmpeg hasn't been spawned yet (still inside Popen() in
+                # recording_worker) — flag it so that worker kills it as
+                # soon as it has a process handle, instead of us racing
+                # to kill a process that doesn't exist yet.
+                entry["cancelled"] = True
+            else:
+                del active_records[record_id]
+    if proc is not None:
+        await _kill_and_reap(proc, label=f"recording {record_id} (stop requested)")
     return RedirectResponse(url="/", status_code=303)
 
 
@@ -5621,8 +5879,17 @@ async def play_vlc(input_id: str, request: Request):
 # Routes — filesystem browser (used by driver path picker)
 # ---------------------------------------------------------------------------
 
+# The driver-path picker only ever needs to reach the Magewell installer
+# under the service account's own files. Confining it to this tree (instead
+# of the whole filesystem root) removes it as a full-disk recon tool for
+# anyone holding an authenticated session, without changing normal usage.
+_ADMIN_BROWSE_ROOT = os.path.realpath(
+    os.environ.get("ADMIN_BROWSE_ROOT", os.path.expanduser("~"))
+)
+
+
 @app.get("/admin/browse")
-async def browse_filesystem(path: str = "/"):
+async def browse_filesystem(path: str = _ADMIN_BROWSE_ROOT):
     """Return directory listing for the folder browser UI.
 
     Returns:
@@ -5633,18 +5900,21 @@ async def browse_filesystem(path: str = "/"):
         "has_install_sh": bool   # true if install.sh is in this dir
       }
     """
-    # Normalise and clamp to absolute path
+    # Normalise and clamp to absolute path, then to the allowed root
     try:
         resolved = os.path.realpath(os.path.normpath(path))
     except Exception:
-        resolved = "/"
+        resolved = _ADMIN_BROWSE_ROOT
 
     if not os.path.isdir(resolved):
         resolved = os.path.dirname(resolved)
     if not os.path.isdir(resolved):
-        resolved = "/"
+        resolved = _ADMIN_BROWSE_ROOT
 
-    parent = os.path.dirname(resolved) if resolved != "/" else None
+    if resolved != _ADMIN_BROWSE_ROOT and not resolved.startswith(_ADMIN_BROWSE_ROOT + os.sep):
+        resolved = _ADMIN_BROWSE_ROOT
+
+    parent = os.path.dirname(resolved) if resolved != _ADMIN_BROWSE_ROOT else None
 
     dirs = []
     try:
@@ -5679,11 +5949,18 @@ async def browse_filesystem(path: str = "/"):
 async def driver_set_path(installer_path: str = Form(...)):
     """Save the Magewell installer path to config."""
     installer_path = installer_path.strip().rstrip("/")
-    if installer_path and not os.path.isfile(os.path.join(installer_path, "install.sh")):
-        return JSONResponse(
-            {"ok": False, "error": f"install.sh not found in: {installer_path}"},
-            status_code=400,
-        )
+    if installer_path:
+        real = os.path.realpath(installer_path)
+        if real != _ADMIN_BROWSE_ROOT and not real.startswith(_ADMIN_BROWSE_ROOT + os.sep):
+            return JSONResponse(
+                {"ok": False, "error": f"Installer path must be under {_ADMIN_BROWSE_ROOT}"},
+                status_code=400,
+            )
+        if not os.path.isfile(os.path.join(installer_path, "install.sh")):
+            return JSONResponse(
+                {"ok": False, "error": f"install.sh not found in: {installer_path}"},
+                status_code=400,
+            )
     _save_installer_path(installer_path)
     log.info("Magewell installer path updated to: %s", installer_path)
     return JSONResponse({"ok": True, "path": installer_path})
