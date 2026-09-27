@@ -9,6 +9,7 @@ input_config.json
 provider_settings.json
 stream_settings.json
 upnp_uuid.txt
+alert_config.json
 
 # large local artifact
 raw-audio.bin
