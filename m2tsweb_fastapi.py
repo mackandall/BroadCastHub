@@ -2705,6 +2705,73 @@ async def _kill_and_reap(proc, label: str = "") -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Event-loop freeze protection
+# ---------------------------------------------------------------------------
+# CONFIRMED 2026-10-05: right after a channel tune started capture, the whole
+# event loop stopped (no log line, no request served, SIGTERM ignored) for an
+# hour. Jellyfin's tune of that channel never got a byte and, because Jellyfin
+# opens live streams one at a time, every recording on every tuner waited behind
+# it. Nothing inside this process can time out while the loop is frozen, so the
+# fix is outside it: the loop pings systemd's watchdog (WatchdogSec in the unit);
+# if the pings stop, systemd sends SIGABRT and restarts the service. faulthandler
+# turns that SIGABRT into a traceback of every thread in the journal, which shows
+# what the loop was stuck in. `kill -USR1 <pid>` dumps the same without stopping.
+import faulthandler, signal
+faulthandler.enable()
+try:
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
+except Exception:
+    pass
+
+LOOP_STALL_WARN_SECS = 5.0
+
+
+def _sd_notify(message: str) -> bool:
+    """Send one sd_notify message; False when not run under systemd (no NOTIFY_SOCKET)."""
+    path = os.environ.get("NOTIFY_SOCKET")
+    if not path:
+        return False
+    if path.startswith("@"):
+        path = "\0" + path[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.connect(path)
+            sock.sendall(message.encode())
+        return True
+    except OSError as exc:
+        log.warning("sd_notify failed: %s", exc)
+        return False
+
+
+async def systemd_watchdog_loop():
+    """Ping systemd from the event loop itself, so the pings stop exactly when the loop freezes.
+
+    Also logs any stall longer than LOOP_STALL_WARN_SECS (the sleep below
+    overrunning), so shorter freezes that the watchdog doesn't catch still show up.
+    """
+    interval = 1.0
+    try:
+        watchdog_usec = int(os.environ.get("WATCHDOG_USEC", "0"))
+    except ValueError:
+        watchdog_usec = 0
+    if watchdog_usec:
+        log.info("systemd watchdog active: the service restarts if the event loop stops for %.0fs", watchdog_usec / 1e6)
+    else:
+        log.info("systemd watchdog not configured (no WatchdogSec in the unit): only logging event-loop stalls")
+    loop = asyncio.get_running_loop()
+    last_ping = 0.0
+    while True:
+        before = loop.time()
+        await asyncio.sleep(interval)
+        stall = loop.time() - before - interval
+        if stall > LOOP_STALL_WARN_SECS:
+            log.warning("Event loop was blocked for %.1fs", stall)
+        if watchdog_usec and loop.time() - last_ping >= watchdog_usec / 1e6 / 4:
+            _sd_notify("WATCHDOG=1")
+            last_ping = loop.time()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _tty_fd    = None
@@ -2722,6 +2789,7 @@ async def lifespan(app: FastAPI):
     edid_task     = asyncio.create_task(edid_refresh_loop())
     stray_task    = asyncio.create_task(stray_device_sleep_loop())
     adb_auth_task = asyncio.create_task(adb_auth_monitor_loop())
+    sd_watchdog_task = asyncio.create_task(systemd_watchdog_loop())
 
     # UPnP/DLNA SSDP — best-effort; a failure here (e.g. port 1900 already
     # in use by another SSDP responder on this machine) is logged but
@@ -2740,6 +2808,7 @@ async def lifespan(app: FastAPI):
         stray_task.cancel()
         adb_auth_task.cancel()
         ssdp_announce_task.cancel()
+        sd_watchdog_task.cancel()
         for hb_input_id in list(input_heartbeat_tasks.keys()):
             _cancel_heartbeat(hb_input_id)
         if ssdp_transport is not None:
