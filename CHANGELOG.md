@@ -9,6 +9,69 @@ system instead of raw physical inputs.
 
 ## Channel Tuning
 
+### Added: FastChannels Player watch — restart a player that stopped mid-stream
+- 2026-10-14: a 30 s DirecTV CDN timeout left the player on "Source error"
+  for the rest of the night. The capture card kept encoding the black
+  screen, so the stream, the tuner and the recording all looked healthy.
+- While a FastChannels channel is tuned, the heartbeat now also checks the
+  player's media session every 30 s. Errored, stopped or gone on two checks
+  running, or buffering/paused for over 60 s, means the channel is resolved
+  again and the player restarted on the box; the capture keeps running, so
+  the recording continues in the same file. Logged as "Player watch: …".
+- After three failed restarts it retries every 2 minutes, and emails
+  (alert_config.json) once when two in a row didn't help.
+- Channels page, "Tuning Method": checkbox to turn it off (on by default).
+
+### Added: FastChannels tuning method, switchable with the provider-app method
+- New `fastchannels` provider: FastChannels resolves a channel to a
+  manifest + Widevine licence URL and Broadcast Hub starts FastChannels
+  Player (`com.fastchannels.player`) on whichever pool device is free —
+  no provider app, no channel numbers. Measured on onn 4K boxes: ~5 s
+  from request to picture, two channels started at once, 1080p + AC-3 5.1.
+- Channels page, "Tuning Method": one switch between the provider app on
+  the DirecTV boxes and FastChannels Player on the onn boxes. Each method
+  keeps its own device address per input, and channels keep both their
+  provider fields and their FastChannels mapping, so switching back
+  restores the other setup exactly. Refused while a tuner is in use.
+- "Match channels to FastChannels" fills each channel's mapping
+  (`fc_source` + `fc_channel_id`) by guide station id, then name.
+- Ready means the player's own media session reports PLAYING; a player
+  that never starts playing fails the tune instead of recording black.
+  Release force-stops the player before sleeping the box.
+- `/fastchannels/playlist.m3u` (public, `?feed=` and `?guide=xmltv|gracenote|all`):
+  FastChannels' own player playlist with the stream URLs pointed at this
+  server, so every channel FastChannels publishes for its player (Amazon,
+  DirecTV, ...) tunes through the pool here instead of FastChannels' single
+  fixed device. Those channels need no channels.json entry — their id,
+  `fc:<source>:<channel id>`, says what to play.
+
+### Added: Plex's protected free channels (`plexlive.py`)
+- Plex lists and serves a few of its free live channels (Crunchyroll,
+  CINEVAULT, CINEVAULT: Classics, CINEVAULT: Westerns, GET Comedy, Stories
+  by AMC) only to a DRM-capable client. `/plexlive/playlist.m3u` offers them
+  as channels tuned here (FastChannels Player on a pool box, stream and
+  licence URLs straight from Plex with an anonymous token), and
+  `/plexlive/epg.xml` is their guide from Plex's own listings (7 days,
+  rebuilt every 3 hours). Both public, like the other playlists.
+- FastChannels: when it has no stream for a channel, ask it to scrape that
+  source again and retry once (setting on the Tuning Method card).
+- Fixed: `/fans/config` had lost its route decorator, so the dashboard
+  showed no CoolerControl profiles after a page reload.
+
+### Added: network encoder inputs and reserved tuners
+- New input driver `network`: an HDMI port of a network encoder that
+  already serves MPEG-TS over HTTP (ffmpeg copies it; nothing is encoded
+  here). Added from the Channels page ("Add a network tuner") or
+  `POST /inputs/network`; the key comes from the URL
+  (`http://192.168.1.168/8.ts` -> `168-8`).
+- Inputs can be reserved with a `pool`: tuners marked "Plex channels only"
+  serve the `/plexlive` channels and nothing else, and the general pool is
+  left to the provider channels. A setting lets Plex channels borrow a
+  general-pool tuner when theirs are busy (off by default).
+- A network encoder shows its own NO SIGNAL card while a box wakes from
+  sleep (~7 s on an onn stick), so a tune that had to wake the box waits
+  that out before the capture starts.
+
 ### Added: channel-number tuning (`directv_number` provider)
 - New selectable provider alongside the existing deep-link method
   (`directv_now`), chosen per-channel from the same Provider dropdown.

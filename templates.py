@@ -924,6 +924,23 @@ def render_multiview(all_ids: list, live_ids: list, cfg: dict) -> str:
 #   should_be_live    : snapshot of SHOULD_BE_LIVE dict  (for fault/restart badges)
 #   format_ext        : FORMAT_EXT constant dict
 
+def _device_label(iid: str, entry: dict) -> str:
+    """A device row's label: network tuners say so, and what they're kept for."""
+    label = _label(iid)
+    if entry.get("driver") == "network":
+        label = "Network tuner · Input " + iid.split("-", 1)[-1]
+    if entry.get("pool") == "plex":
+        label += ' <span style="font-size:9px;color:#4dc8a0;font-weight:700">PLEX ONLY</span>'
+    return label
+
+
+def _network_remove_button(iid: str, entry: dict) -> str:
+    if entry.get("driver") != "network":
+        return ""
+    return (f'<button class="btn q-btn" style="font-size:10px;padding:5px 10px" '
+            f"onclick=\"removeNetworkTuner('{iid}')\">Remove</button>")
+
+
 def render_channels(all_ids: list, cfg: dict) -> str:
     """Render the standalone Channels page: tuner/device mapping (which
     ADB/Roku remote IP is plugged into which physical input) plus the
@@ -941,7 +958,7 @@ def render_channels(all_ids: list, cfg: dict) -> str:
     device_rows_html = "\n".join(
         f"""
         <div class="device-row" data-input-id="{iid}">
-          <span class="device-row-label">{_label(iid)}</span>
+          <span class="device-row-label">{_device_label(iid, cfg.get(iid, {}))}</span>
           <select class="dl-input device-remote-type" style="width:120px" onchange="onDeviceRemoteTypeChange('{iid}')">
             <option value="none" {"selected" if cfg.get(iid, {}).get("remote_type", "none") == "none" else ""}>No Remote</option>
             <option value="adb"  {"selected" if cfg.get(iid, {}).get("remote_type") == "adb"  else ""}>ADB (Android TV)</option>
@@ -952,6 +969,7 @@ def render_channels(all_ids: list, cfg: dict) -> str:
             value="{html.escape(cfg.get(iid, {}).get('remote_ip', ''), quote=True)}"
             {"disabled" if cfg.get(iid, {}).get("remote_type", "none") == "none" else ""}>
           <button class="btn q-btn" style="font-size:10px;padding:5px 10px" onclick="saveDeviceRemote('{iid}')">Save</button>
+          {_network_remove_button(iid, cfg.get(iid, {}))}
           <span class="device-row-status" id="device-status-{iid}"></span>
         </div>"""
         for iid in all_ids
@@ -1154,6 +1172,70 @@ def render_channels(all_ids: list, cfg: dict) -> str:
     <div id="device-rows-container">
       {device_rows_html}
     </div>
+    <div style="font-size:11px;font-weight:700;margin-top:14px">Add a network tuner</div>
+    <div style="font-size:11px;color:var(--muted);margin:4px 0 8px">
+      An HDMI port on a network encoder, with the Android box plugged into it. A tuner kept for
+      Plex channels is used only by the channels in the Plex playlist, never by the others.
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <input class="dl-input" id="net-tuner-url" type="text" style="flex:2;min-width:220px" placeholder="Encoder stream, e.g. http://192.168.1.168/8.ts">
+      <input class="dl-input" id="net-tuner-ip" type="text" style="flex:1;min-width:140px" placeholder="Box address, e.g. 192.168.1.14">
+      <select class="dl-input" id="net-tuner-pool" style="width:170px">
+        <option value="plex">Plex channels only</option>
+        <option value="">General pool</option>
+      </select>
+      <button class="btn q-btn" style="font-size:10px;padding:5px 12px" onclick="addNetworkTuner()">Add / Update</button>
+      <span id="net-tuner-status" style="font-size:10px;color:var(--muted)"></span>
+    </div>
+  </div>
+
+  <div class="section-header"><div class="section-lbl">&#128250; Tuning Method</div></div>
+  <div class="card">
+    <div style="font-size:11px;color:var(--muted);margin-bottom:10px">
+      How channels are tuned, and which boxes are plugged into the inputs. Both methods
+      stay set up — switching only changes which one is used, and points each input at
+      that method's box. Nothing can be switched while a channel is being watched or recorded.
+    </div>
+    <div id="tuning-mode-options" style="display:flex;flex-direction:column;gap:6px"></div>
+    <div class="dl-grid" style="margin-top:12px">
+      <label class="dl-lbl">FastChannels address</label>
+      <input class="dl-input" id="tuning-fc-url" type="text" placeholder="http://192.168.1.10:5523">
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;margin-top:8px">
+      <input type="checkbox" id="tuning-fc-captions">
+      <label for="tuning-fc-captions" style="font-size:11px;cursor:pointer">
+        FastChannels Player shows closed captions (they end up in recordings)
+      </label>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;margin-top:8px">
+      <input type="checkbox" id="tuning-fc-refresh">
+      <label for="tuning-fc-refresh" style="font-size:11px;cursor:pointer">
+        When FastChannels has no stream for a channel, ask it to refresh that source and try again
+        (adds about 15 seconds to that tune; needed for some Amazon channels)
+      </label>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;margin-top:8px">
+      <input type="checkbox" id="tuning-fc-watch">
+      <label for="tuning-fc-watch" style="font-size:11px;cursor:pointer">
+        Check the FastChannels Player every 30 seconds while a channel is tuned, and restart it when it stops playing
+        (otherwise a stream error leaves the recording black until it ends)
+      </label>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;margin-top:8px">
+      <input type="checkbox" id="tuning-plex-fallback">
+      <label for="tuning-plex-fallback" style="font-size:11px;cursor:pointer">
+        When the tuners kept for Plex channels are all busy (or there are none), use a free tuner from the general pool
+      </label>
+    </div>
+    <div style="font-size:11px;font-weight:700;margin-top:14px">Device address per input</div>
+    <div id="tuning-devices" style="margin-top:6px"></div>
+    <div style="display:flex;gap:8px;margin-top:12px;align-items:center;flex-wrap:wrap">
+      <button class="btn q-btn" style="font-size:10px;padding:5px 12px" onclick="saveTuning()">Save Tuning Method</button>
+      <button class="btn q-btn" style="font-size:10px;padding:5px 12px" onclick="matchFastChannels()">Match channels to FastChannels</button>
+      <input class="dl-input" id="tuning-fc-source" type="text" value="directv" title="FastChannels source to match against"
+        style="width:90px;font-size:11px;padding:3px 6px">
+      <span id="tuning-status" style="font-size:10px;color:var(--muted)"></span>
+    </div>
   </div>
 
   <div class="section-header"><div class="section-lbl">&#9881; Provider Timing Settings</div></div>
@@ -1330,6 +1412,10 @@ def render_channels(all_ids: list, cfg: dict) -> str:
       <input class="dl-input" id="ce-content-id" type="text" placeholder="acf51074-6940-81d8-2355-c2eb610e0afc">
       <label class="dl-lbl">Settle Time (s)</label>
       <input class="dl-input" id="ce-settle-time" type="number" min="5" max="120" value="20">
+      <label class="dl-lbl">FastChannels Source</label>
+      <input class="dl-input" id="ce-fc-source" type="text" placeholder="directv">
+      <label class="dl-lbl">FastChannels Channel ID</label>
+      <input class="dl-input" id="ce-fc-channel-id" type="text" placeholder="8208">
     </div>
     <div id="ce-status" style="font-size:11px;color:var(--muted);margin-top:8px;min-height:14px"></div>
     <div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">
@@ -1505,6 +1591,120 @@ def render_channels(all_ids: list, cfg: dict) -> str:
     }} catch(e) {{ showToast('Network error', false); }}
   }}
 
+  // ── Network tuners ────────────────────────────────────────────────────────────
+
+  async function addNetworkTuner() {{
+    const status = document.getElementById('net-tuner-status');
+    const fd = new FormData();
+    fd.append('url', document.getElementById('net-tuner-url').value.trim());
+    fd.append('remote_ip', document.getElementById('net-tuner-ip').value.trim());
+    fd.append('pool', document.getElementById('net-tuner-pool').value);
+    status.textContent = 'Saving…';
+    try {{
+      const res  = await fetch('/inputs/network', {{method: 'POST', body: fd}});
+      const data = await res.json();
+      if (data.ok) {{ showToast(`${{data.label}} saved`); location.reload(); }}
+      else {{ status.textContent = data.error || 'Failed'; showToast(data.error || 'Failed', false); }}
+    }} catch(e) {{ showToast('Network error', false); }}
+  }}
+
+  async function removeNetworkTuner(inputId) {{
+    if (!confirm('Remove this network tuner?')) return;
+    try {{
+      const res  = await fetch(`/inputs/network/${{encodeURIComponent(inputId)}}/remove`, {{method: 'POST'}});
+      const data = await res.json();
+      if (data.ok) location.reload(); else showToast(data.error || 'Failed', false);
+    }} catch(e) {{ showToast('Network error', false); }}
+  }}
+
+  // ── Tuning method ─────────────────────────────────────────────────────────────
+
+  let _tuningModes = [];
+  let _tuningInputs = [];
+
+  async function loadTuning() {{
+    try {{
+      const res  = await fetch('/channels/tuning');
+      const data = await res.json();
+      if (!data.ok) return;
+      _tuningModes  = data.modes;
+      _tuningInputs = data.inputs;
+      document.getElementById('tuning-mode-options').innerHTML = data.modes.map(m => `
+        <label style="font-size:12px;cursor:pointer;display:flex;align-items:center;gap:8px">
+          <input type="radio" name="tuning-mode" value="${{m.key}}" ${{m.key === data.mode ? 'checked' : ''}}>
+          <span style="font-weight:${{m.key === data.mode ? 700 : 400}}">${{m.label}}</span>
+        </label>`).join('');
+      document.getElementById('tuning-fc-url').value        = data.fastchannels_url || '';
+      document.getElementById('tuning-fc-captions').checked = !!data.fastchannels_captions;
+      document.getElementById('tuning-fc-refresh').checked  = data.fastchannels_refresh_on_no_stream !== false;
+      document.getElementById('tuning-fc-watch').checked    = data.fastchannels_player_watch !== false;
+      document.getElementById('tuning-plex-fallback').checked = data.plex_pool_fallback !== false;
+      document.getElementById('tuning-devices').innerHTML = `
+        <div style="display:grid;grid-template-columns:60px repeat(${{data.modes.length}},1fr);gap:6px;align-items:center;font-size:11px">
+          <span style="color:var(--muted)">Input</span>
+          ${{data.modes.map(m => `<span style="color:var(--muted)">${{m.label}}</span>`).join('')}}
+          ${{data.inputs.map(iid => `
+            <span style="font-family:'Courier New',monospace">${{iid}}</span>
+            ${{data.modes.map(m => `<input class="dl-input tuning-device-input" type="text"
+              data-mode="${{m.key}}" data-input="${{iid}}" placeholder="not connected"
+              value="${{(data.devices[m.key] || {{}})[iid] || ''}}" style="font-size:11px;padding:3px 6px">`).join('')}}
+          `).join('')}}
+        </div>`;
+      document.getElementById('tuning-status').textContent =
+        `${{data.fastchannels_mapped}} of ${{data.channels_total}} channels matched to FastChannels`;
+    }} catch(e) {{}}
+  }}
+
+  async function saveTuning() {{
+    const status = document.getElementById('tuning-status');
+    const picked = document.querySelector('input[name="tuning-mode"]:checked');
+    if (!picked) return;
+    const devices = {{}};
+    _tuningModes.forEach(m => devices[m.key] = {{}});
+    document.querySelectorAll('.tuning-device-input').forEach(inp => {{
+      if (inp.value.trim()) devices[inp.dataset.mode][inp.dataset.input] = inp.value.trim();
+    }});
+    const fd = new FormData();
+    fd.append('mode', picked.value);
+    fd.append('fastchannels_url', document.getElementById('tuning-fc-url').value.trim());
+    fd.append('fastchannels_captions', document.getElementById('tuning-fc-captions').checked ? 'true' : 'false');
+    fd.append('fastchannels_refresh_on_no_stream', document.getElementById('tuning-fc-refresh').checked ? 'true' : 'false');
+    fd.append('fastchannels_player_watch', document.getElementById('tuning-fc-watch').checked ? 'true' : 'false');
+    fd.append('plex_pool_fallback', document.getElementById('tuning-plex-fallback').checked ? 'true' : 'false');
+    fd.append('devices', JSON.stringify(devices));
+    try {{
+      const res  = await fetch('/channels/tuning', {{method: 'POST', body: fd}});
+      const data = await res.json();
+      if (data.ok) {{
+        showToast('Tuning method saved');
+        // Device Mapping above is rendered server-side from the same addresses.
+        if (data.retargeted) location.reload(); else loadTuning();
+      }} else {{
+        status.textContent = data.error || 'Save failed';
+        showToast(data.error || 'Save failed', false);
+      }}
+    }} catch(e) {{ showToast('Network error', false); }}
+  }}
+
+  async function matchFastChannels() {{
+    const status = document.getElementById('tuning-status');
+    const fd = new FormData();
+    fd.append('source', document.getElementById('tuning-fc-source').value.trim() || 'directv');
+    status.textContent = 'Matching…';
+    try {{
+      const res  = await fetch('/channels/fastchannels/match', {{method: 'POST', body: fd}});
+      const data = await res.json();
+      if (data.ok) {{
+        const missing = data.unmatched.length ? ` — no match: ${{data.unmatched.join(', ')}}` : '';
+        status.textContent = `${{data.fastchannels_mapped}} of ${{data.channels_total}} channels matched to FastChannels (${{data.matched}} new)${{missing}}`;
+        refreshChannelsList();
+      }} else {{
+        status.textContent = data.error || 'Match failed';
+        showToast(data.error || 'Match failed', false);
+      }}
+    }} catch(e) {{ showToast('Network error', false); }}
+  }}
+
   // ── Channels ──────────────────────────────────────────────────────────────────
 
   let _channelProviders = [];
@@ -1580,6 +1780,8 @@ def render_channels(all_ids: list, cfg: dict) -> str:
     document.getElementById('ce-callsign').value      = ch ? ch.callsign : '';
     document.getElementById('ce-content-id').value    = ch ? ch.content_id : '';
     document.getElementById('ce-settle-time').value   = ch ? ch.settle_time_secs : 20;
+    document.getElementById('ce-fc-source').value     = ch ? (ch.fc_source || '') : '';
+    document.getElementById('ce-fc-channel-id').value = ch ? (ch.fc_channel_id || '') : '';
     document.getElementById('ce-status').textContent  = '';
     document.getElementById('channel-editor-overlay').classList.add('show');
   }}
@@ -1601,6 +1803,8 @@ def render_channels(all_ids: list, cfg: dict) -> str:
     fd.append('callsign',          document.getElementById('ce-callsign').value.trim());
     fd.append('content_id',        document.getElementById('ce-content-id').value.trim());
     fd.append('settle_time_secs',  document.getElementById('ce-settle-time').value || '20');
+    fd.append('fc_source',         document.getElementById('ce-fc-source').value.trim());
+    fd.append('fc_channel_id',     document.getElementById('ce-fc-channel-id').value.trim());
     try {{
       const res  = await fetch('/channels/save', {{method: 'POST', body: fd}});
       const data = await res.json();
@@ -1773,6 +1977,7 @@ def render_channels(all_ids: list, cfg: dict) -> str:
   }}
 
   refreshChannelsList();
+  loadTuning();
   loadProviderSettings();
   loadStreamSettings();
 </script>
@@ -2037,8 +2242,17 @@ def render_dashboard(
               </div>
             </div>"""
 
+        else:
+            mw_panel = ""
+
         # Q control is always visible (Decklink CBR mode removed)
         q_row_style = ""
+        if driver == "network":
+            # A network encoder does its own encoding: no quality or encoder to
+            # pick here, and the signal pill says what the input is fed by.
+            q_row_style = ' style="display:none"'
+            encoder_select_html = ""
+            sig_html = f'<span class="sig-pill sig-other">◯ Network encoder · {html.escape(cfg.get(i, {}).get("url", ""))}</span>'
 
         # Action buttons
         hls_btn = (

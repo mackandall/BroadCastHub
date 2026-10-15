@@ -3,6 +3,10 @@ import logging
 import smtplib
 from email.mime.text import MIMEText
 import auth as _auth
+import fastchannels as _fc
+import plexlive as _plex
+import shlex
+from urllib.parse import quote as _url_quote
 from datetime import datetime
 from fastapi import FastAPI, Request, Response, Form
 from fastapi.responses import StreamingResponse, HTMLResponse, RedirectResponse, JSONResponse
@@ -523,6 +527,22 @@ def _build_capture_cmd(input_id: str, cfg: dict) -> list:
 
         return cmd
 
+    elif driver == "network":
+        # A network HDMI encoder that already serves MPEG-TS over HTTP (one
+        # URL per HDMI input). Nothing to encode here: ffmpeg only copies the
+        # stream to stdout, reconnecting if the encoder drops the connection.
+        url = (cfg.get("url") or "").strip()
+        if not re.match(r"^https?://[A-Za-z0-9.\-]+(:\d+)?/[A-Za-z0-9._/\-]*$", url):
+            raise ValueError(f"Input {input_id} has no usable encoder URL")
+        return [
+            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+            "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+            "-fflags", "+genpts+discardcorrupt",
+            "-i", url,
+            "-map", "0:v:0", "-map", "0:a?", "-c", "copy",
+            "-f", "mpegts", "pipe:1",
+        ]
+
     else:
         raise ValueError(f"Unknown driver '{driver}' for input {input_id}")
 
@@ -644,6 +664,8 @@ def _split_key(key: str):
 
 def _label(key: str, channel: int = None) -> str:
     b, i = _split_key(key)
+    if input_config.get(key, {}).get("driver") == "network":
+        return f"Network tuner · Input {i}"
     # Key is now board-channel, so i is already the per-board input number
     return f"Board {b} · Input {i}"
 
@@ -777,7 +799,55 @@ PROVIDER_PROFILES = {
         "settle_after_ready_secs":    1.5,
         "stop_keycode": "KEYCODE_SLEEP",
     },
+    "fastchannels": {
+        "label":            "FastChannels Player (direct stream)",
+        # No provider app at all: FastChannels resolves the channel to a
+        # manifest + Widevine licence URL, and its small player app is
+        # started on the device with those two URLs (see fastchannels.py
+        # and the "fastchannels" branch of _try_tune_device). The channel
+        # needs fc_source + fc_channel_id instead of a guide number or a
+        # callsign/content id.
+        "tuning_method":    "fastchannels",
+        "package":          _fc.PLAYER_PACKAGE,
+        # The player holds the screen on while it plays; the inert keycode
+        # is kept only as a guard against the box's own screensaver.
+        "heartbeat_keycode":        "KEYCODE_ZENKAKU_HANKAKU",
+        "heartbeat_interval_secs":  180,
+        # Measured 2026-10-11 on an onn 4K box: ~4.5 s from am start to
+        # PLAYING for a DirecTV channel (manifest + licence round trip).
+        "readiness_timeout_secs":     15,
+        # Ready means THIS package's media session reports PLAYING. The
+        # generic gate's patterns can't be used: its audio-focus check can
+        # fire while the player is still buffering, and its media-session
+        # check isn't tied to a package (and newer Android prints
+        # "state=PLAYING(3)", not "state=3").
+        "readiness_package_media_session": True,
+        "settle_after_ready_secs":    1.5,
+        "stop_keycode": "KEYCODE_SLEEP",
+    },
 }
+
+# Tuning mode — one switch for "which boxes are plugged in, and how are
+# they tuned". Both stay available; nothing about either is lost by
+# switching (see _apply_tuning_mode):
+#   "provider"     — each channel's own provider method (DirecTV app by
+#                    channel number or deep link) on the provider boxes.
+#   "fastchannels" — the FastChannels player on the streaming boxes, for
+#                    every channel that has a FastChannels mapping.
+# Each mode remembers its own device address per input, since the two sets
+# of boxes share the same HDMI inputs.
+TUNING_MODES = {
+    "provider":     "Provider app on the device (DirecTV boxes)",
+    "fastchannels": "FastChannels Player (onn boxes)",
+}
+TUNING_MODE_DEFAULT = "provider"
+FASTCHANNELS_CAPTIONS_DEFAULT = False
+FASTCHANNELS_REFRESH_DEFAULT = True
+# Player watch (see _heartbeat_loop): check the FastChannels player while a
+# channel is tuned and restart it when it stops playing.
+FASTCHANNELS_PLAYER_WATCH_DEFAULT = True
+PLAYER_CHECK_SECS = 30
+PLAYER_STUCK_SECS = 60
 
 # ---------------------------------------------------------------------------
 # Provider settings overrides — the safe, user-adjustable subset
@@ -891,7 +961,188 @@ input_heartbeat_tasks: dict = {}   # input_id -> asyncio.Task, running while a c
 tuner_selection_lock = asyncio.Lock()
 
 
-def _get_tuner_pool() -> list:
+def _tuning_mode() -> str:
+    mode = stream_settings.get("tuning_mode", TUNING_MODE_DEFAULT)
+    return mode if mode in TUNING_MODES else TUNING_MODE_DEFAULT
+
+
+def _channel_provider_key(ch: dict) -> str:
+    """Which provider profile tunes this channel right now: FastChannels
+    for everything in "fastchannels" mode, else the channel's own provider
+    (which may itself be "fastchannels" — a per-channel choice)."""
+    if _tuning_mode() == "fastchannels":
+        return "fastchannels"
+    return ch.get("provider", "")
+
+
+# Channels FastChannels publishes for its player can be tuned without a
+# channels.json entry: the id itself says what to play. These are the ids
+# /fastchannels/playlist.m3u hands out.
+FC_CHANNEL_PREFIX = "fc:"
+# Plex's protected free channels (see plexlive.py) are tuned the same way —
+# the same player on the same boxes — but get their two URLs from Plex
+# itself: "plex:<Plex channel id>". These are the ids /plexlive/playlist.m3u
+# hands out.
+PLEX_CHANNEL_PREFIX = "plex:"
+PLEX_DIRECT_SOURCE  = "plex-live"
+_fc_adhoc_channels: dict = {}   # channel_id -> channel dict (name + fc_id learned along the way)
+_fc_playlist_feed = "default"   # FastChannels feed the playlist was last requested for
+
+
+def _lookup_channel(channel_id: str) -> dict | None:
+    """A configured channel, or an ad-hoc FastChannels one for an
+    "fc:<source>:<source channel id>" id. Caller holds channels_config_lock."""
+    if channel_id in channels_config:
+        return channels_config[channel_id]
+    if channel_id.startswith(PLEX_CHANNEL_PREFIX):
+        plex_id = channel_id[len(PLEX_CHANNEL_PREFIX):]
+        if plex_id and all(ch.isalnum() or ch == "-" for ch in plex_id):
+            return _fc_adhoc_channels.setdefault(channel_id, {
+                "display_name":  plex_id,
+                "provider":      "fastchannels",
+                "fc_source":     PLEX_DIRECT_SOURCE,
+                "fc_channel_id": plex_id,
+                "enabled":       True,
+            })
+        return None
+    if channel_id.startswith(FC_CHANNEL_PREFIX):
+        source, _, fc_channel_id = channel_id[len(FC_CHANNEL_PREFIX):].partition(":")
+        if source and fc_channel_id:
+            return _fc_adhoc_channels.setdefault(channel_id, {
+                "display_name":  fc_channel_id,
+                "provider":      "fastchannels",
+                "fc_source":     source,
+                "fc_channel_id": fc_channel_id,
+                "enabled":       True,
+            })
+    return None
+
+
+# How long a "FastChannels has no stream for this channel" answer is
+# trusted before asking again. A client that keeps re-requesting a dead
+# channel (Jellyfin's web player retries for as long as the tab is open)
+# then costs one cheap refusal per request instead of a tune attempt each.
+FC_UNAVAILABLE_TTL_SECS = 30
+_fc_unavailable: dict = {}   # channel_id -> (expires_at, error)
+
+# A FastChannels source is asked for a fresh scrape at most this often when
+# one of its channels has no stream.
+FC_REFRESH_COOLDOWN_SECS = 180
+_fc_source_refreshed: dict = {}   # source name -> time of the last scrape we asked for
+
+# When the player starts but never reaches PLAYING, the cause is usually
+# the stream (licence refused, provider-side error), not the box — so only
+# this many boxes are tried before giving up, rather than the whole pool
+# at one readiness timeout each while every other tune waits on the lock.
+FC_NOT_PLAYING_MAX_DEVICES = 2
+
+
+async def _fc_playback(channel_id: str, ch: dict) -> tuple:
+    """Resolve a FastChannels channel to its manifest + licence URL and
+    confirm the manifest is really being served. Returns (playback, None)
+    or (None, error) — an error here is about the channel, not a device."""
+    cached = _fc_unavailable.get(channel_id)
+    if cached and cached[0] > time.time():
+        return None, cached[1]
+    _fc_unavailable.pop(channel_id, None)
+
+    if ch.get("fc_source") == PLEX_DIRECT_SOURCE:
+        try:
+            playback = await asyncio.get_running_loop().run_in_executor(None, lambda: _plex.playback(ch["fc_channel_id"]))
+        except _plex.PlexLiveError as exc:
+            error = f"{ch.get('display_name', channel_id)}: {exc}"
+            _fc_unavailable[channel_id] = (time.time() + FC_UNAVAILABLE_TTL_SECS, error)
+            return None, error
+        return playback, None
+
+    fc_url = stream_settings.get("fastchannels_url", "").strip()
+    if not fc_url:
+        return None, "FastChannels address is not set (Channels page, Tuning Method)"
+    fc_source     = ch.get("fc_source", "").strip()
+    fc_channel_id = ch.get("fc_channel_id", "").strip()
+    if not fc_source or not fc_channel_id:
+        return None, f"Channel {channel_id} has no FastChannels mapping (fc_source / fc_channel_id)"
+
+    loop = asyncio.get_running_loop()
+    try:
+        if channel_id in _fc_adhoc_channels and not ch.get("fc_id") and ch.get("display_name") == fc_channel_id:
+            # Asked for before anyone fetched the playlist since startup:
+            # learn the channel's name, which the lookup below needs.
+            for entry in await loop.run_in_executor(None, lambda: _fc.feed_entries(fc_url, _fc_playlist_feed)):
+                if (entry["source"], entry["channel_id"]) == (fc_source, fc_channel_id):
+                    ch["display_name"] = entry["name"]
+        playback = await loop.run_in_executor(
+            None,
+            lambda: _fc.resolve_playback(
+                fc_url, fc_source, fc_channel_id,
+                fc_id=ch.get("fc_id"), name_hint=ch.get("display_name", ""),
+            ),
+        )
+        if not playback["manifest_url"]:
+            raise _fc.FastChannelsError(f"FastChannels returned no stream for {fc_source}/{fc_channel_id}")
+        try:
+            await loop.run_in_executor(None, lambda: _fc.check_manifest(playback["manifest_url"]))
+        except _fc.FastChannelsError as no_stream:
+            # Access to the stream can lapse between FastChannels' own scrapes of
+            # the source; a scrape now usually brings it back (see
+            # fastchannels.refresh_source). Once per source per cooldown, so a
+            # channel that is really gone costs one scrape, not one per request.
+            last = _fc_source_refreshed.get(fc_source, 0)
+            if not stream_settings.get("fastchannels_refresh_on_no_stream", FASTCHANNELS_REFRESH_DEFAULT) \
+                    or time.time() - last < FC_REFRESH_COOLDOWN_SECS:
+                raise
+            _fc_source_refreshed[fc_source] = time.time()
+            t_refresh = time.time()
+            refreshed = await loop.run_in_executor(None, lambda: _fc.refresh_source(fc_url, fc_source))
+            log.info(
+                "FastChannels: %s had no stream (%s) — asked for a fresh scrape of %s, done=%s after %.1fs",
+                ch.get("display_name", channel_id), no_stream, fc_source, refreshed, time.time() - t_refresh,
+            )
+            if not refreshed:
+                raise
+            # Everything waiting on the same source gets another go as well.
+            for other in [cid for cid, c in _fc_adhoc_channels.items() if c.get("fc_source") == fc_source]:
+                _fc_unavailable.pop(other, None)
+            await loop.run_in_executor(None, lambda: _fc.check_manifest(playback["manifest_url"]))
+    except _fc.FastChannelsError as exc:
+        error = f"{ch.get('display_name', channel_id)}: {exc}"
+        _fc_unavailable[channel_id] = (time.time() + FC_UNAVAILABLE_TTL_SECS, error)
+        return None, error
+    if channel_id in _fc_adhoc_channels:
+        _fc_adhoc_channels[channel_id]["fc_id"] = playback["fc_id"]
+    return playback, None
+
+
+# Inputs can be reserved for one kind of channel through their "pool" field.
+# The only named pool so far: tuners kept for Plex's protected channels, so
+# those never take a box the provider channels record on.
+POOL_GENERAL = ""
+POOL_PLEX    = "plex"
+POOL_LABELS  = {POOL_GENERAL: "General pool", POOL_PLEX: "Plex channels only"}
+# Off by default: the boxes in the general pool are for the provider channels
+# only, and a Plex channel waits for (or fails on) its own reserved tuners.
+PLEX_POOL_FALLBACK_DEFAULT = False
+
+# A box woken from sleep takes a while to put a picture back on its HDMI
+# output. A capture card reports "no signal" for that time and simply starts
+# late; a network encoder keeps streaming regardless and fills the gap with
+# its own NO SIGNAL card (measured: ~7 s on an onn stick), which would open
+# every recording. So a tune that had to wake the box on a network input
+# waits out the rest of this before the capture starts.
+NETWORK_HDMI_WAKE_SECS = 9.0
+
+
+def _channel_pools(ch: dict) -> list:
+    """The pools a channel may be tuned on, in order of preference."""
+    if ch.get("fc_source") == PLEX_DIRECT_SOURCE:
+        pools = [POOL_PLEX]
+        if stream_settings.get("plex_pool_fallback", PLEX_POOL_FALLBACK_DEFAULT):
+            pools.append(POOL_GENERAL)   # when the reserved tuners are all busy (or there are none)
+        return pools
+    return [POOL_GENERAL]
+
+
+def _get_tuner_pool(pool: str | None = None) -> list:
     """Build the ordered tuner pool from existing input_config — any input
     with an ADB remote configured is a candidate tuner. Deliberately reuses
     the same remote_type/remote_ip fields the ADB-Home-after-recording and
@@ -902,14 +1153,17 @@ def _get_tuner_pool() -> list:
     everywhere else in the app for input keys) so tuner selection is
     reproducible run to run, mirroring ah4c's fixed-array iteration order.
     """
-    pool = []
+    # pool=None: every tuner, whatever it is reserved for.
+    tuners = []
     for input_id in _sort_ids(list(INPUT_IDS)):
         cfg = input_config.get(input_id, {})
         remote_type = cfg.get("remote_type", "none")
         remote_ip   = cfg.get("remote_ip", "").strip()
+        if pool is not None and cfg.get("pool", POOL_GENERAL) != pool:
+            continue
         if remote_type == "adb" and remote_ip:
-            pool.append((input_id, remote_ip))
-    return pool
+            tuners.append((input_id, remote_ip))
+    return tuners
 
 
 async def _adb_shell(remote_ip: str, args: list, timeout: int = 15):
@@ -958,7 +1212,18 @@ async def _readiness_gate(remote_ip: str, provider: dict) -> bool:
     audio_grep   = provider.get("readiness_audio_pack_grep", f"pack: {package}.*gain: GAIN ")
     media_grep   = provider.get("readiness_media_state_grep", r"PlaybackState \{state=3")
 
-    if provider.get("require_window_focus"):
+    if provider.get("readiness_package_media_session"):
+        # Only this package's own media session counts, and only PLAYING —
+        # see the comment on the fastchannels provider profile.
+        shell_script = (
+            f"end=$((SECONDS+{timeout_secs}))\n"
+            f"while [ $SECONDS -lt $end ]; do\n"
+            f"  dumpsys media_session 2>/dev/null | grep -A14 'package={package}$' | "
+            f"grep -qE 'state=PlaybackState \\{{state=(PLAYING\\(3\\)|3,)' && exit 0\n"
+            f"done\n"
+            f"exit 1"
+        )
+    elif provider.get("require_window_focus"):
         window_grep = provider.get("readiness_window_focus_grep", rf"mCurrentFocus=Window.*{package}")
         shell_script = (
             f"end=$((SECONDS+{timeout_secs}))\n"
@@ -987,19 +1252,139 @@ async def _readiness_gate(remote_ip: str, provider: dict) -> bool:
         return False
 
 
-async def _heartbeat_loop(input_id: str, remote_ip: str, keycode: str, interval_secs: int):
+async def _fc_start_player(remote_ip: str, package: str, ch: dict, playback: dict):
+    """Start the FastChannels player on a box with a resolved manifest +
+    licence URL. Used by the tune and by the player watch's restart."""
+    # Start from a stopped player every time: a player still on its
+    # previous channel already reports PLAYING, which would let the
+    # readiness gate pass before the new channel is up.
+    await _adb_shell(remote_ip, ["am", "force-stop", package], timeout=10)
+
+    # One explicitly quoted string: adb hands everything after
+    # "shell" to the device's shell as a single line, so separate
+    # list items would NOT keep a title like "$100000 Pyramid" or a
+    # URL with & intact.
+    remote_cmd = " ".join([
+        "am", "start", "-n", shlex.quote(_fc.PLAYER_COMPONENT),
+        "--es", "stream_url", shlex.quote(playback["manifest_url"]),
+        "--es", "title", shlex.quote(ch.get("display_name") or playback["name"] or "Broadcast Hub"),
+        "--ez", "drm", "true" if playback["license_url"] else "false",
+        "--ez", "captions", "true" if stream_settings.get("fastchannels_captions", FASTCHANNELS_CAPTIONS_DEFAULT) else "false",
+    ])
+    if playback["license_url"]:
+        remote_cmd += " --es license_url " + shlex.quote(playback["license_url"])
+    return await _adb_shell(remote_ip, [remote_cmd], timeout=15)
+
+
+async def _fc_player_state(remote_ip: str, package: str):
+    """The player's own media-session state: "PLAYING", "BUFFERING",
+    "ERROR", "STOPPED", "PAUSED", "NONE"…, "GONE" when it has no session
+    (the app died), or None when the box couldn't be asked."""
+    try:
+        result = await _adb_shell(
+            remote_ip,
+            [f"dumpsys media_session 2>/dev/null | grep -A14 'package={package}$' | grep -m1 'state=PlaybackState'; echo __answered"],
+            timeout=8,
+        )
+    except Exception:
+        return None
+    # adb's own failures (box offline, not found) also exit 1 — only a box
+    # that ran the line prints the marker.
+    if "__answered" not in result.stdout:
+        return None
+    m = re.search(r"state=PlaybackState \{state=([A-Z_]+|\d+)", result.stdout)
+    if not m:
+        return "GONE"
+    # Older Android prints the number only.
+    return {"0": "NONE", "1": "STOPPED", "2": "PAUSED", "3": "PLAYING", "6": "BUFFERING", "7": "ERROR"}.get(m.group(1), m.group(1))
+
+
+async def _fc_player_restart(input_id: str, remote_ip: str, channel_id: str, ch: dict, provider: dict, why: str) -> bool:
+    """Put a box's player back on its channel after it stopped mid-stream
+    (2026-10-14: a 30 s DirecTV CDN timeout left the player on "Source
+    error" for the rest of the night, and the capture card recorded the
+    black screen as a healthy stream). The capture keeps running, so the
+    recording just carries on. True when the player is playing again."""
+    package = provider.get("package", "")
+    name = ch.get("display_name", channel_id)
+    playback, fc_error = await _fc_playback(channel_id, ch)
+    if fc_error:
+        log.warning("Player watch: input %s (%s) — %s; can't restart the player: %s", input_id, name, why, fc_error)
+        return False
+    result = await _fc_start_player(remote_ip, package, ch, playback)
+    ready = await _readiness_gate(remote_ip, provider)
+    state = input_tuning_state.get(input_id)
+    if state and state.get("channel_id") == channel_id:
+        state["player_restarts"] = state.get("player_restarts", 0) + 1
+        state["last_player_restart"] = time.time()
+    log.warning(
+        "Player watch: input %s (%s on %s) — %s; restarted the player: %s (returncode=%s)",
+        input_id, name, remote_ip, why, "playing again" if ready else "STILL NOT PLAYING", result.returncode,
+    )
+    return ready
+
+
+async def _heartbeat_loop(input_id: str, remote_ip: str, keycode: str, interval_secs: int, watch: dict | None = None):
     """Background task: sends an inert keycode periodically to reset the
     source app's own UI-inactivity timer (confirmed necessary — DirecTV's
     app restarts playback mid-stream after 5 minutes without this). Runs
-    until cancelled (channel change, release, or explicit stop)."""
-    log.info("Heartbeat started for input %s (%s every %ds)", input_id, keycode, interval_secs)
+    until cancelled (channel change, release, or explicit stop).
+
+    With watch (channel_id, ch, provider) it also checks the FastChannels
+    player every PLAYER_CHECK_SECS and restarts it when it has stopped
+    playing: an errored, stopped or dead player — or one buffering or
+    paused for longer than PLAYER_STUCK_SECS — on two checks running."""
+    log.info("Heartbeat started for input %s (%s every %ds%s)", input_id, keycode, interval_secs,
+             f", player check every {PLAYER_CHECK_SECS}s" if watch else "")
+    tick = min(interval_secs, PLAYER_CHECK_SECS) if watch else interval_secs
+    since_key = 0.0
+    bad_checks = 0
+    stuck_since = None
+    failed_restarts = 0
+    emailed = False
     try:
         while True:
-            await asyncio.sleep(interval_secs)
-            try:
-                await _adb_shell(remote_ip, ["input", "keyevent", keycode], timeout=5)
-            except Exception as exc:
-                log.warning("Heartbeat keyevent failed for %s: %s", input_id, exc)
+            await asyncio.sleep(tick)
+            since_key += tick
+            if since_key >= interval_secs:
+                since_key = 0.0
+                try:
+                    await _adb_shell(remote_ip, ["input", "keyevent", keycode], timeout=5)
+                except Exception as exc:
+                    log.warning("Heartbeat keyevent failed for %s: %s", input_id, exc)
+
+            if not watch or not stream_settings.get("fastchannels_player_watch", FASTCHANNELS_PLAYER_WATCH_DEFAULT):
+                continue
+            # Several failed restarts in a row: try less often (every 2 min).
+            if failed_restarts >= 3 and (time.time() - (input_tuning_state.get(input_id) or {}).get("last_player_restart", 0)) < 120:
+                continue
+            state = await _fc_player_state(remote_ip, watch["provider"].get("package", ""))
+            if state is None:
+                continue   # the box didn't answer — not the player's fault
+            if state == "PLAYING":
+                bad_checks, stuck_since, failed_restarts = 0, None, 0
+                continue
+            if state in ("BUFFERING", "PAUSED"):
+                stuck_since = stuck_since or time.time()
+                if time.time() - stuck_since < PLAYER_STUCK_SECS:
+                    continue
+            bad_checks += 1
+            if bad_checks < 2:
+                continue
+
+            why = f"player {state.lower()}" + (f" for {int(time.time() - stuck_since)}s" if stuck_since else "")
+            ok = await _fc_player_restart(input_id, remote_ip, watch["channel_id"], watch["ch"], watch["provider"], why)
+            bad_checks, stuck_since = 0, None
+            failed_restarts = 0 if ok else failed_restarts + 1
+            if not ok and failed_restarts == 2 and not emailed:
+                emailed = True
+                name = watch["ch"].get("display_name", watch["channel_id"])
+                asyncio.create_task(_send_email_alert(
+                    f"Broadcast Hub: {name} is recording a blank screen",
+                    f"The FastChannels player on {remote_ip} (input {input_id}) stopped playing {name} ({why}) "
+                    f"and two restarts didn't bring it back. Broadcast Hub keeps trying every 2 minutes; "
+                    f"until then the recording on this channel is black.",
+                ))
     except asyncio.CancelledError:
         log.info("Heartbeat stopped for input %s", input_id)
         raise
@@ -1125,6 +1510,17 @@ async def _try_tune_device(input_id: str, remote_ip: str, channel_id: str, ch: d
                 else "no edid_path configured",
             )
 
+        # Only matters for network inputs — see NETWORK_HDMI_WAKE_SECS. Asked
+        # before the connect step, whose own check already wakes the box.
+        was_asleep = False
+        if input_cfg_snapshot.get("driver") == "network":
+            try:
+                power = await _adb_shell(remote_ip, ["dumpsys", "power"], timeout=8)
+                was_asleep = "mWakefulness=Awake" not in power.stdout
+            except Exception:
+                was_asleep = True   # can't tell: assume the slow case
+        t_first_wake = time.time()
+
         connect_ok, connect_msg = await _adb_connect_with_retry(remote_ip)
         t_connect = time.time()
         log.info(
@@ -1190,6 +1586,42 @@ async def _try_tune_device(input_id: str, remote_ip: str, channel_id: str, ch: d
                 input_id, remote_ip, t_start - t_after_gate, number_result.returncode,
                 guide_number, number_result.stdout.strip(), number_result.stderr.strip(),
             )
+        elif tuning_method == "fastchannels":
+            # Not a device's fault when this fails — no point trying the
+            # other tuners.
+            playback, fc_error = await _fc_playback(channel_id, ch)
+            if fc_error:
+                return {"ok": False, "fatal": True, "error": fc_error}
+            t_resolve = time.time()
+
+            result = await _fc_start_player(remote_ip, package, ch, playback)
+            t_start = time.time()
+            launch_stdout = result.stdout.strip()
+            launch_stderr = result.stderr.strip()
+            log.info(
+                "Tune step [fastchannels-start] input=%s remote_ip=%s resolve=%.2fs start=%.2fs returncode=%s\n"
+                "  stream=%s\n  stdout=%r\n  stderr=%r",
+                input_id, remote_ip, t_resolve - t_wake, t_start - t_resolve, result.returncode,
+                playback["manifest_url"], launch_stdout, launch_stderr,
+            )
+            # Same `am start` exit-code trap as the deep-link path below:
+            # a missing player app still returns 0, with "Error" in the text.
+            if "Error" in launch_stdout or "Error" in launch_stderr:
+                return {"ok": False, "error": f"FastChannels Player did not start on {remote_ip} (is it installed?): {launch_stderr or launch_stdout}"}
+
+            # Unlike the provider apps, a failed gate here is treated as a
+            # failed tune: the player has no channel of its own to fall back
+            # to, so "not playing" means a black screen would be recorded.
+            t_before_gate = time.time()
+            ready = await _readiness_gate(remote_ip, provider)
+            log.info(
+                "Tune step [readiness-gate] input=%s remote_ip=%s took=%.2fs ready=%s "
+                "(total tune time so far: %.2fs)",
+                input_id, remote_ip, time.time() - t_before_gate, ready, time.time() - t0,
+            )
+            if not ready:
+                await _adb_shell(remote_ip, ["am", "force-stop", package], timeout=10)
+                return {"ok": False, "not_playing": True, "error": f"FastChannels Player on {remote_ip} never started playing {ch.get('display_name', channel_id)}"}
         else:
             # EXPERIMENT RESULT (2026-09-06): disabled force-stop to test
             # whether it was the main source of extra latency vs ah4c's
@@ -1271,6 +1703,11 @@ async def _try_tune_device(input_id: str, remote_ip: str, channel_id: str, ch: d
         settle_secs = provider.get("settle_after_ready_secs", 0)
         if settle_secs:
             await asyncio.sleep(settle_secs)
+    if was_asleep:
+        hdmi_wait = NETWORK_HDMI_WAKE_SECS - (time.time() - t_first_wake)
+        if hdmi_wait > 0:
+            log.info("Tune step [hdmi-wake] input=%s woke from sleep on a network input — waiting %.1fs more for its picture", input_id, hdmi_wait)
+            await asyncio.sleep(hdmi_wait)
 
     # Only claim the tuner (mark active) once we've actually attempted the
     # tune — mirrors ah4c setting t.active=true right before returning
@@ -1280,6 +1717,7 @@ async def _try_tune_device(input_id: str, remote_ip: str, channel_id: str, ch: d
         "tuned_at":   time.time(),
         "ready":      ready,
         "active":     True,
+        "tuning_method": tuning_method,
     }
 
     # CONFIRMED BUG, fixed here: the heartbeat used to only start when
@@ -1297,8 +1735,11 @@ async def _try_tune_device(input_id: str, remote_ip: str, channel_id: str, ch: d
     heartbeat_kc  = provider.get("heartbeat_keycode")
     heartbeat_int = provider.get("heartbeat_interval_secs", 0)
     if heartbeat_kc and heartbeat_int:
+        watch = None
+        if tuning_method == "fastchannels":
+            watch = {"channel_id": channel_id, "ch": ch, "provider": provider}
         input_heartbeat_tasks[input_id] = asyncio.create_task(
-            _heartbeat_loop(input_id, remote_ip, heartbeat_kc, heartbeat_int)
+            _heartbeat_loop(input_id, remote_ip, heartbeat_kc, heartbeat_int, watch)
         )
 
     if not ready:
@@ -1319,14 +1760,16 @@ async def _select_and_tune_channel(channel_id: str) -> dict:
     anything already marked active, first success wins.
     """
     async with channels_config_lock:
-        ch = channels_config.get(channel_id)
+        ch = _lookup_channel(channel_id)
     if not ch:
         return {"ok": False, "error": f"Unknown channel_id: {channel_id}"}
 
-    provider_key = ch.get("provider", "")
+    provider_key = _channel_provider_key(ch)
     provider = _get_effective_provider(provider_key)
     if not provider:
         return {"ok": False, "error": f"Unknown provider: {provider_key}"}
+    if provider.get("tuning_method") == "fastchannels" and not (ch.get("fc_source") and ch.get("fc_channel_id")):
+        return {"ok": False, "error": f"Channel {channel_id} has no FastChannels mapping — match it on the Channels page, or switch the tuning method"}
 
     # Timing note: tuner_selection_lock is held for the ENTIRE tune
     # sequence below (wake/force-stop/am-start/readiness-gate for
@@ -1347,7 +1790,7 @@ async def _select_and_tune_channel(channel_id: str) -> dict:
                 channel_id, wait_time,
             )
         async with input_config_lock:
-            candidates = _get_tuner_pool()
+            candidates = [t for pool in _channel_pools(ch) for t in _get_tuner_pool(pool)]
 
         if not candidates:
             return {"ok": False, "error": "No ADB-configured inputs available as tuners"}
@@ -1360,6 +1803,7 @@ async def _select_and_tune_channel(channel_id: str) -> dict:
                 return {"ok": True, "already_tuned": True, "input_id": input_id}
 
         last_error = None
+        not_playing = 0
         for input_id, remote_ip in candidates:
             state = input_tuning_state.get(input_id, {})
             if state.get("active"):
@@ -1373,12 +1817,27 @@ async def _select_and_tune_channel(channel_id: str) -> dict:
                 )
                 return {"ok": True, "already_tuned": False, **result}
             last_error = result.get("error")
+            if result.get("fatal"):
+                log.warning("Channel %s cannot be tuned on any tuner: %s", channel_id, last_error)
+                break
+            if result.get("not_playing"):
+                not_playing += 1
+                if not_playing >= FC_NOT_PLAYING_MAX_DEVICES:
+                    log.warning(
+                        "Channel %s did not start playing on %d boxes — treating it as a stream problem, not trying more",
+                        channel_id, not_playing,
+                    )
+                    _fc_unavailable[channel_id] = (time.time() + FC_UNAVAILABLE_TTL_SECS, last_error)
+                    break
             log.warning("Tuner %s failed (%s) — trying next available tuner", input_id, last_error)
 
         log.warning(
             "Channel %s: no available tuner succeeded — held tuner_selection_lock for %.2fs total",
             channel_id, time.time() - t_acquired,
         )
+        if last_error is None:
+            # Nothing was even tried: every tuner this channel may use is taken.
+            return {"ok": False, "error": f"All {len(candidates)} tuner(s) this channel can use are busy"}
         return {"ok": False, "error": f"No available tuner could complete the tune (last error: {last_error})"}
 
 
@@ -1424,6 +1883,13 @@ async def _release_tuner(input_id: str) -> dict:
     _cancel_heartbeat(input_id)
 
     sleep_ok = None   # None = not attempted (no remote_ip configured)
+    if remote_ip and current.get("tuning_method") == "fastchannels":
+        # The player has no stop command; without this it would keep
+        # pulling the stream (and holding a provider session) while asleep.
+        try:
+            await _adb_shell(remote_ip, ["am", "force-stop", _fc.PLAYER_PACKAGE], timeout=10)
+        except Exception as exc:
+            log.warning("Release: could not stop FastChannels Player on %s (input %s): %s", remote_ip, input_id, exc)
     if remote_ip:
         try:
             result = await _adb_shell(remote_ip, ["input", "keyevent", "KEYCODE_SLEEP"], timeout=10)
@@ -1545,6 +2011,11 @@ def _save_config(cfg: dict, active: list, hidden: set, user_prefs: dict = None):
                     "edid_path":       v.get("edid_path", ""),
                     "edid_refresh":    v.get("edid_refresh", False),
                 })
+            elif driver == "network":
+                entry["url"] = v.get("url", "")
+            # Which channels may use this input ("" = the general pool).
+            if v.get("pool"):
+                entry["pool"] = v["pool"]
             data[k] = entry
         data["__active__"] = list(active)
         data["__hidden__"] = list(hidden)
@@ -1645,6 +2116,15 @@ def _bootstrap():
         return {"driver": "magewell", "board": b, "input": i, "channel": i, "signal": "NONE", "desc": ""}
 
     def _make_entry(key, hw_data):
+        saved_entry = saved_entries.get(key, {})
+        if saved_entry.get("driver") == "network":
+            return {**saved_entry, "signal": "NETWORK", "desc": saved_entry.get("url", "")}
+        entry = _make_hw_entry(key, hw_data)
+        if saved_entry.get("pool"):
+            entry["pool"] = saved_entry["pool"]
+        return entry
+
+    def _make_hw_entry(key, hw_data):
         return _build_entry(
             key,
             hw_data.get("board", 0), hw_data.get("input", 0), hw_data.get("channel", 1),
@@ -1951,6 +2431,8 @@ _PUBLIC_PATHS = {
     "/discover.json", "/lineup.json", "/lineup.xml", "/lineup_status.json",
     # Channel M3U export — same reasoning, read by DVR clients directly.
     "/channels/export.m3u",
+    "/fastchannels/playlist.m3u",
+    "/plexlive/playlist.m3u", "/plexlive/epg.xml",
 }
 _PUBLIC_PREFIXES = (
     "/hls/", "/stream/",
@@ -3756,6 +4238,7 @@ async def set_remote(
         # Keep legacy adb_ip in sync for backwards compat
         input_config[input_id]["adb_ip"] = remote_ip if remote_type == "adb" else ""
         _save_config(input_config, INPUT_IDS, HIDDEN_IDS)
+        await _remember_tuner_device(input_id, remote_ip if remote_type == "adb" else "")
 
     connected    = False
     connect_msg  = ""
@@ -3817,6 +4300,7 @@ async def set_adb_ip(input_id: str, adb_ip: str = Form(...)):
         input_config[input_id]["remote_type"] = "adb" if adb_ip else "none"
         input_config[input_id]["remote_ip"]   = adb_ip
         _save_config(input_config, INPUT_IDS, HIDDEN_IDS)
+        await _remember_tuner_device(input_id, adb_ip)
     connected = False
     connect_msg = ""
     if adb_ip:
@@ -4371,6 +4855,8 @@ async def channels_save(
     settle_time_secs: int = Form(20),
     enabled:      bool = Form(True),
     guide_station_id: str = Form(""),
+    fc_source:     str = Form(""),
+    fc_channel_id: str = Form(""),
 ):
     # NOTE: no input_id field — channels are no longer tied to a fixed
     # input. Which physical device serves a given channel request is
@@ -4385,6 +4871,7 @@ async def channels_save(
     if provider not in PROVIDER_PROFILES:
         return JSONResponse({"ok": False, "error": f"Unknown provider: {provider}"}, status_code=400)
     async with channels_config_lock:
+        previous = channels_config.get(channel_id, {})
         channels_config[channel_id] = {
             "display_name":     display_name.strip() or channel_id,
             "guide_number":     guide_number.strip(),
@@ -4398,7 +4885,17 @@ async def channels_save(
             # its configured lineups — e.g. a DirecTV free channel whose own
             # listing isn't offered in Channels' mapping screen.
             "guide_station_id": re.sub(r"\D", "", guide_station_id or ""),
+            # The channel's identity in FastChannels (source name + that
+            # source's own channel id) — what the "fastchannels" tuning
+            # method plays. Filled by "Match channels to FastChannels".
+            "fc_source":     fc_source.strip(),
+            "fc_channel_id": fc_channel_id.strip(),
         }
+        # fc_id is only a lookup shortcut for that identity; keep it while
+        # the identity is unchanged.
+        if (previous.get("fc_source"), previous.get("fc_channel_id")) == (fc_source.strip(), fc_channel_id.strip()) \
+                and previous.get("fc_id"):
+            channels_config[channel_id]["fc_id"] = previous["fc_id"]
         _save_channels_config(channels_config)
     return JSONResponse({"ok": True})
 
@@ -4547,6 +5044,10 @@ async def channels_import_m3u(
                 # being refreshed — re-importing an updated M3U should
                 # not silently re-enable something the user turned off.
                 ch["enabled"] = channels_config[channel_id].get("enabled", True)
+                # ...nor drop its FastChannels mapping, which an M3U can't carry.
+                for field in ("fc_source", "fc_channel_id", "fc_id"):
+                    if field in channels_config[channel_id]:
+                        ch[field] = channels_config[channel_id][field]
             channels_config[channel_id] = ch
         _save_channels_config(channels_config)
 
@@ -4611,6 +5112,356 @@ SAME_CLIENT_EVICTION_DEFAULT = True
 # under a second) — toggle off to isolate it during testing, or if a
 # specific setup finds it isn't helping.
 EDID_REFRESH_ON_TUNE_DEFAULT = True
+
+
+def _tuner_devices() -> dict:
+    """{mode: {input_id: device address}} — each tuning mode's own boxes."""
+    saved = stream_settings.get("tuner_devices")
+    devices = {mode: dict((saved or {}).get(mode) or {}) for mode in TUNING_MODES}
+    return devices
+
+
+async def _remember_tuner_device(input_id: str, remote_ip: str) -> None:
+    """Record an input's device address under the CURRENT tuning mode, so
+    an address edited by hand in Device Mapping survives a later switch to
+    the other mode and back. Caller may hold input_config_lock."""
+    if input_config.get(input_id, {}).get("pool"):
+        return   # reserved tuners aren't part of either mode's device set
+    async with stream_settings_lock:
+        devices = _tuner_devices()
+        if remote_ip:
+            devices[_tuning_mode()][input_id] = remote_ip
+        else:
+            devices[_tuning_mode()].pop(input_id, None)
+        stream_settings["tuner_devices"] = devices
+        _save_stream_settings(stream_settings)
+
+
+async def _apply_tuning_mode(mode: str, devices: dict) -> None:
+    """Switch tuning mode: point every input at that mode's device.
+
+    The pool, the remote buttons, the stray-device sweep and the ADB-auth
+    monitor all read an input's single remote_ip, so that one field is what
+    changes. The mode being left keeps its addresses in tuner_devices, and
+    channels keep both their provider fields and their FastChannels mapping
+    — switching back restores the previous setup exactly.
+    """
+    async with input_config_lock:
+        for input_id in INPUT_IDS:
+            remote_ip = devices.get(mode, {}).get(input_id, "")
+            cfg = input_config.get(input_id)
+            if cfg is None or cfg.get("pool"):
+                continue   # a reserved tuner keeps its own box whatever the mode
+            if remote_ip:
+                cfg["remote_type"], cfg["remote_ip"], cfg["adb_ip"] = "adb", remote_ip, remote_ip
+            elif cfg.get("remote_type") == "adb":
+                # This input has no box in the new mode — take it out of the
+                # pool rather than leave the other mode's address on it.
+                cfg["remote_type"], cfg["remote_ip"], cfg["adb_ip"] = "none", "", ""
+        _save_config(input_config, INPUT_IDS, HIDDEN_IDS)
+
+
+@app.get("/channels/tuning")
+async def channels_get_tuning():
+    async with channels_config_lock:
+        total  = len(channels_config)
+        mapped = sum(1 for ch in channels_config.values() if ch.get("fc_source") and ch.get("fc_channel_id"))
+    async with input_config_lock:
+        input_ids = [iid for iid in _sort_ids(list(INPUT_IDS)) if not input_config.get(iid, {}).get("pool")]
+        current   = {
+            iid: input_config.get(iid, {}).get("remote_ip", "")
+            for iid in input_ids if input_config.get(iid, {}).get("remote_type") == "adb"
+        }
+    async with stream_settings_lock:
+        mode    = _tuning_mode()
+        devices = _tuner_devices()
+        # What's live on the inputs is the truth for the current mode.
+        devices[mode] = {**devices[mode], **{k: v for k, v in current.items() if v}}
+        return JSONResponse({
+            "ok": True,
+            "mode": mode,
+            "modes": [{"key": k, "label": v} for k, v in TUNING_MODES.items()],
+            "inputs": input_ids,
+            "devices": devices,
+            "fastchannels_url":      stream_settings.get("fastchannels_url", ""),
+            "fastchannels_captions": stream_settings.get("fastchannels_captions", FASTCHANNELS_CAPTIONS_DEFAULT),
+            "fastchannels_refresh_on_no_stream": stream_settings.get("fastchannels_refresh_on_no_stream", FASTCHANNELS_REFRESH_DEFAULT),
+            "fastchannels_player_watch": stream_settings.get("fastchannels_player_watch", FASTCHANNELS_PLAYER_WATCH_DEFAULT),
+            "plex_pool_fallback":    stream_settings.get("plex_pool_fallback", PLEX_POOL_FALLBACK_DEFAULT),
+            "fastchannels_mapped":   mapped,
+            "channels_total":        total,
+        })
+
+
+@app.post("/channels/tuning")
+async def channels_save_tuning(
+    mode: str = Form(...),
+    fastchannels_url: str = Form(""),
+    fastchannels_captions: bool = Form(FASTCHANNELS_CAPTIONS_DEFAULT),
+    fastchannels_refresh_on_no_stream: bool = Form(FASTCHANNELS_REFRESH_DEFAULT),
+    fastchannels_player_watch: bool = Form(FASTCHANNELS_PLAYER_WATCH_DEFAULT),
+    plex_pool_fallback: bool = Form(PLEX_POOL_FALLBACK_DEFAULT),
+    devices: str = Form("{}"),
+):
+    """Save the tuning method, FastChannels' address, and each mode's
+    device address per input. devices is JSON: {mode: {input_id: address}}.
+    """
+    if mode not in TUNING_MODES:
+        return JSONResponse({"ok": False, "error": f"Unknown tuning mode: {mode}"}, status_code=400)
+    fastchannels_url = fastchannels_url.strip().rstrip("/")
+    if fastchannels_url and not re.match(r"^https?://[A-Za-z0-9.\-]+(:\d+)?$", fastchannels_url):
+        return JSONResponse({"ok": False, "error": "FastChannels address must look like http://192.168.1.10:5523"}, status_code=400)
+    if re.match(r"^https?://(127\.|localhost)", fastchannels_url):
+        return JSONResponse({"ok": False, "error": "Use this server's network address for FastChannels, not localhost — the boxes fetch the stream from it"}, status_code=400)
+    try:
+        submitted = json.loads(devices or "{}")
+        new_devices = {
+            m: {
+                str(iid): str(ip).strip()
+                for iid, ip in (submitted.get(m) or {}).items() if str(ip).strip()
+            }
+            for m in TUNING_MODES
+        }
+    except Exception:
+        return JSONResponse({"ok": False, "error": "devices must be JSON"}, status_code=400)
+    for m, per_input in new_devices.items():
+        for iid, ip in per_input.items():
+            if iid not in INPUT_IDS or not _valid_remote_host(ip):
+                return JSONResponse({"ok": False, "error": f"Bad device address for input {iid}: {ip}"}, status_code=400)
+    if mode == "fastchannels" and not fastchannels_url:
+        return JSONResponse({"ok": False, "error": "Set FastChannels' address before switching to it"}, status_code=400)
+
+    # Held across the whole change so no tune can start half-way through
+    # with one mode's method and the other mode's device.
+    async with tuner_selection_lock:
+        old_mode = _tuning_mode()
+        retargeted = mode != old_mode or new_devices.get(mode) != _tuner_devices().get(mode)
+        if retargeted and any(st.get("active") for st in input_tuning_state.values()):
+            return JSONResponse({
+                "ok": False,
+                "error": "A channel is being watched or recorded — stop it before changing the tuning method or the current devices",
+            }, status_code=409)
+        async with stream_settings_lock:
+            stream_settings["tuning_mode"]           = mode
+            stream_settings["fastchannels_url"]      = fastchannels_url
+            stream_settings["fastchannels_captions"] = fastchannels_captions
+            stream_settings["fastchannels_refresh_on_no_stream"] = fastchannels_refresh_on_no_stream
+            stream_settings["fastchannels_player_watch"] = fastchannels_player_watch
+            stream_settings["plex_pool_fallback"] = plex_pool_fallback
+            stream_settings["tuner_devices"]         = new_devices
+            _save_stream_settings(stream_settings)
+        if retargeted:
+            await _apply_tuning_mode(mode, new_devices)
+            log.info("Tuning mode: %s -> %s, devices %s", old_mode, mode, new_devices.get(mode))
+    return JSONResponse({"ok": True, "mode": mode, "retargeted": retargeted})
+
+
+@app.get("/fastchannels/playlist.m3u")
+async def fastchannels_playlist(request: Request, feed: str = "default", guide: str = "all"):
+    """FastChannels' player playlist, with every stream URL pointed at this
+    server instead of at FastChannels' own single-device trigger — so those
+    channels tune through the whole pool here like any other channel.
+
+    Everything else on each line (names, numbers, logos, tvg-id / guide
+    station id) is FastChannels' own, so its guide (epg.xml) still matches.
+    guide=xmltv | gracenote | all picks which of FastChannels' two player
+    playlists to include (see fastchannels.FEED_VARIANTS).
+    """
+    fc_url = stream_settings.get("fastchannels_url", "").strip()
+    if not fc_url:
+        return Response("FastChannels address is not set (Channels page, Tuning Method).\n", status_code=503, media_type="text/plain")
+    if not re.match(r"^[A-Za-z0-9_\-]+$", feed):
+        return Response("Bad feed name.\n", status_code=400, media_type="text/plain")
+    loop = asyncio.get_running_loop()
+    try:
+        entries = await loop.run_in_executor(None, lambda: _fc.feed_entries(fc_url, feed, guide))
+    except _fc.FastChannelsError as exc:
+        return Response(f"{exc}\n", status_code=502, media_type="text/plain")
+    global _fc_playlist_feed
+    _fc_playlist_feed = feed
+    base = _hdhr_base_url(request)
+    lines = ["#EXTM3U"]
+    async with channels_config_lock:
+        for entry in entries:
+            channel_id = f"{FC_CHANNEL_PREFIX}{entry['source']}:{entry['channel_id']}"
+            # The name is what lets a tune find the channel in FastChannels.
+            _lookup_channel(channel_id)["display_name"] = entry["name"]
+            lines.append(entry["extinf"])
+            lines.append(f"{base}/channel/{_url_quote(channel_id, safe=':')}/stream")
+    return Response(content="\n".join(lines) + "\n", media_type="audio/x-mpegurl")
+
+
+# Plex's guide for its protected channels changes slowly and takes ~50 calls
+# to build, so it's kept for a few hours.
+PLEXLIVE_GUIDE_TTL_SECS    = 3 * 3600
+PLEXLIVE_CHANNELS_TTL_SECS = 15 * 60
+PLEXLIVE_CHNO_START_DEFAULT = 5900
+_plexlive_cache: dict = {}   # "channels" / "guide" -> (fetched_at, value)
+_plexlive_guide_lock = asyncio.Lock()
+
+
+async def _plexlive_channels() -> list:
+    cached = _plexlive_cache.get("channels")
+    if cached and time.time() - cached[0] < PLEXLIVE_CHANNELS_TTL_SECS:
+        return cached[1]
+    try:
+        channels = await asyncio.get_running_loop().run_in_executor(None, _plex.protected_channels)
+    except _plex.PlexLiveError:
+        if cached:
+            return cached[1]   # Plex hiccup: the list we had is better than none
+        raise
+    _plexlive_cache["channels"] = (time.time(), channels)
+    return channels
+
+
+@app.post("/inputs/network")
+async def inputs_add_network(
+    url: str = Form(...),
+    remote_ip: str = Form(""),
+    pool: str = Form(POOL_GENERAL),
+):
+    """Add (or update) an input fed by a network HDMI encoder: the encoder's
+    MPEG-TS URL for one HDMI port, the Android box plugged into that port,
+    and what the tuner is for. The input's key comes from the URL — the
+    encoder address's last number and the port number in the path (e.g.
+    http://192.168.1.168/8.ts -> 168-8) — so saving the same URL again
+    updates the same input.
+    """
+    url, remote_ip, pool = url.strip(), remote_ip.strip(), pool.strip()
+    m = re.match(r"^https?://([A-Za-z0-9.\-]+)(?::\d+)?/(?:[A-Za-z0-9._\-]*/)*?(\d+)[A-Za-z0-9._\-]*$", url)
+    if not m:
+        return JSONResponse({"ok": False, "error": "The encoder URL must look like http://192.168.1.168/8.ts"}, status_code=400)
+    if remote_ip and not _valid_remote_host(remote_ip):
+        return JSONResponse({"ok": False, "error": "The device address must be a plain IP address or hostname"}, status_code=400)
+    if pool not in POOL_LABELS:
+        return JSONResponse({"ok": False, "error": f"Unknown pool: {pool}"}, status_code=400)
+    host_number = re.search(r"(\d+)$", m.group(1))
+    key = f"{int(host_number.group(1)) if host_number else 900}-{int(m.group(2))}"
+    async with input_config_lock:
+        existing = input_config.get(key)
+        if existing and existing.get("driver") != "network":
+            return JSONResponse({"ok": False, "error": f"Input {key} already exists as a capture-card input"}, status_code=409)
+        if input_tuning_state.get(key, {}).get("active"):
+            return JSONResponse({"ok": False, "error": f"Input {key} is in use — stop it first"}, status_code=409)
+        input_config[key] = {
+            "q": 25, "encoder": AVAILABLE_ENCODERS[0],
+            "driver": "network", "url": url,
+            "board": _split_key(key)[0], "input": _split_key(key)[1], "channel": _split_key(key)[1],
+            "remote_type": "adb" if remote_ip else "none", "remote_ip": remote_ip, "adb_ip": remote_ip,
+            "signal": "NETWORK", "desc": url,
+            **({"pool": pool} if pool else {}),
+        }
+        if key not in INPUT_IDS:
+            INPUT_IDS.append(key)
+            INPUT_IDS.sort(key=lambda k: tuple(int(x) for x in k.split("-", 1)))
+        HIDDEN_IDS.discard(key)
+        _save_config(input_config, INPUT_IDS, HIDDEN_IDS)
+    connect_msg = ""
+    if remote_ip:
+        _, connect_msg = await _adb_connect_with_retry(remote_ip, max_retries=1)
+    log.info("Network tuner %s: url=%s device=%s pool=%r (%s)", key, url, remote_ip, pool, connect_msg)
+    return JSONResponse({"ok": True, "key": key, "label": _label(key), "connect_msg": connect_msg})
+
+
+@app.post("/inputs/network/{input_id}/remove")
+async def inputs_remove_network(input_id: str):
+    """Take a network tuner out again (its capture is stopped first)."""
+    async with input_config_lock:
+        if input_config.get(input_id, {}).get("driver") != "network":
+            return JSONResponse({"ok": False, "error": "Not a network tuner"}, status_code=404)
+        if input_tuning_state.get(input_id, {}).get("active"):
+            return JSONResponse({"ok": False, "error": "It is in use — stop it first"}, status_code=409)
+    async with inputs_lock:
+        if input_id in active_inputs:
+            await _kill_and_reap(active_inputs[input_id]["process"], label=f"input {input_id}")
+            del active_inputs[input_id]
+    async with input_config_lock:
+        input_config.pop(input_id, None)
+        if input_id in INPUT_IDS:
+            INPUT_IDS.remove(input_id)
+        HIDDEN_IDS.discard(input_id)
+        _save_config(input_config, INPUT_IDS, HIDDEN_IDS)
+    return JSONResponse({"ok": True})
+
+
+@app.get("/plexlive/playlist.m3u")
+async def plexlive_playlist(request: Request, chno: int = PLEXLIVE_CHNO_START_DEFAULT):
+    """Plex's protected free channels (Crunchyroll, CINEVAULT, ...) as a
+    playlist of channels tuned here, on the pool's boxes. Pair with
+    /plexlive/epg.xml (same tvg-id). chno is the first channel number.
+    """
+    try:
+        channels = await _plexlive_channels()
+    except _plex.PlexLiveError as exc:
+        return Response(f"{exc}\n", status_code=502, media_type="text/plain")
+    base = _hdhr_base_url(request)
+    lines = ["#EXTM3U"]
+    async with channels_config_lock:
+        for index, ch in enumerate(channels):
+            channel_id = f"{PLEX_CHANNEL_PREFIX}{ch['id']}"
+            _lookup_channel(channel_id)["display_name"] = ch["name"]
+            xml_id = _plex.xml_id(ch)
+            name = ch["name"].replace('"', "'")
+            logo = f' tvg-logo="{ch["logo"]}"' if ch["logo"] else ""
+            lines.append(
+                f'#EXTINF:-1 channel-id="{xml_id}" tvg-id="{xml_id}" tvg-name="{name}" '
+                f'tvg-chno="{chno + index}" channel-number="{chno + index}" group-title="Plex"{logo},{ch["name"]}'
+            )
+            lines.append(f"{base}/channel/{channel_id}/stream")
+    return Response(content="\n".join(lines) + "\n", media_type="audio/x-mpegurl")
+
+
+@app.get("/plexlive/epg.xml")
+async def plexlive_guide():
+    """XMLTV guide for /plexlive/playlist.m3u, from Plex's own listings."""
+    async with _plexlive_guide_lock:   # one build at a time; the others wait for it
+        cached = _plexlive_cache.get("guide")
+        if not cached or time.time() - cached[0] > PLEXLIVE_GUIDE_TTL_SECS:
+            try:
+                xml = await asyncio.get_running_loop().run_in_executor(None, _plex.guide_xmltv)
+                _plexlive_cache["guide"] = cached = (time.time(), xml)
+            except _plex.PlexLiveError as exc:
+                if not cached:
+                    return Response(f"{exc}\n", status_code=502, media_type="text/plain")
+                log.warning("Plex live guide refresh failed, serving the previous one: %s", exc)
+    return Response(content=cached[1], media_type="application/xml")
+
+
+@app.post("/channels/fastchannels/match")
+async def channels_fastchannels_match(
+    source: str = Form("directv"),
+    overwrite: bool = Form(False),
+):
+    """Fill in each channel's FastChannels mapping by pairing it with a
+    channel of one FastChannels source (guide station id, then name).
+    Channels that already have a mapping are left alone unless overwrite.
+    """
+    fc_url = stream_settings.get("fastchannels_url", "").strip()
+    if not fc_url:
+        return JSONResponse({"ok": False, "error": "Set FastChannels' address first"}, status_code=400)
+    source = source.strip()
+    async with channels_config_lock:
+        wanted = {
+            cid: dict(ch) for cid, ch in channels_config.items()
+            if overwrite or not (ch.get("fc_source") and ch.get("fc_channel_id"))
+        }
+    loop = asyncio.get_running_loop()
+    try:
+        resolved, unmatched = await loop.run_in_executor(None, lambda: _fc.match_and_resolve(fc_url, source, wanted))
+    except _fc.FastChannelsError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+    async with channels_config_lock:
+        for cid, mapping in resolved.items():
+            if cid in channels_config:
+                channels_config[cid].update(mapping)
+        _save_channels_config(channels_config)
+        total  = len(channels_config)
+        mapped = sum(1 for ch in channels_config.values() if ch.get("fc_source") and ch.get("fc_channel_id"))
+        unmatched_names = [channels_config[cid].get("display_name", cid) for cid in unmatched if cid in channels_config]
+    return JSONResponse({
+        "ok": True, "matched": len(resolved), "unmatched": unmatched_names,
+        "fastchannels_mapped": mapped, "channels_total": total,
+    })
 
 
 async def _release_same_client_viewers(client_ip: str, new_channel_id: str, exclude_input_id: str = None) -> None:
@@ -4707,12 +5558,27 @@ async def channel_stream(channel_id: str, request: Request):
     attempt inside the generator.
     """
     async with channels_config_lock:
-        if channel_id not in channels_config:
+        known = _lookup_channel(channel_id)
+        if known is None:
             return JSONResponse({"ok": False, "error": f"Unknown channel_id: {channel_id}"}, status_code=404)
-        if not channels_config[channel_id].get("enabled", True):
+        if not known.get("enabled", True):
             return JSONResponse({"ok": False, "error": f"Channel {channel_id} is disabled"}, status_code=404)
 
     client_ip = request.client.host if request.client else "unknown"
+
+    # A FastChannels channel just found to have no stream is refused here
+    # with a real HTTP error, before any box is involved. Finding that out
+    # (which can include waiting for FastChannels to scrape the source again)
+    # happens inside the generator below, like everything else slow.
+    provider = _get_effective_provider(_channel_provider_key(known)) or {}
+    if provider.get("tuning_method") == "fastchannels":
+        already = any(st.get("active") and st.get("channel_id") == channel_id for st in input_tuning_state.values())
+        cached = _fc_unavailable.get(channel_id)
+        if not already and cached and cached[0] > time.time():
+            fc_error = cached[1]
+            if fc_error:
+                log.warning("Channel stream: %s refused for %s: %s", channel_id, client_ip, fc_error)
+                return Response(fc_error + "\n", status_code=503, media_type="text/plain", headers={"Retry-After": str(FC_UNAVAILABLE_TTL_SECS)})
 
     # Tear down anything this same client was already watching on a
     # different input BEFORE tuning the new channel — see
@@ -4940,6 +5806,8 @@ async def channels_release(input_id: str):
 
 # ---------------------------------------------------------------------------
 # Routes — fan config
+# ---------------------------------------------------------------------------
+@app.get("/fans/config")
 async def fans_get_config():
     async with _fan_config_lock:
         cfg = dict(_fan_config)
@@ -5033,7 +5901,9 @@ async def hdhr_discover(request: Request):
     # simultaneous physical tuners it actually has; the two numbers are
     # expected to differ, not match.
     async with input_config_lock:
-        tuner_count = len(_get_tuner_pool())
+        # The lineup served here is the provider channels, which only the
+        # general pool tunes — reserved tuners don't add to what it can do.
+        tuner_count = len(_get_tuner_pool(POOL_GENERAL))
     return JSONResponse({
         "FriendlyName":    HDHR_FRIENDLY_NAME,
         "ModelNumber":     HDHR_MODEL_NUMBER,
