@@ -4675,7 +4675,7 @@ def render_dashboard(
     </p>
     <div class="driver-path-row">
       <input class="driver-path-input" id="driver-path-input"
-             placeholder="/home/christophe/src/Magewell/ProCaptureForLinux_1.3.4429"
+             placeholder="/home/you/src/Magewell/ProCaptureForLinux_1.3.4429"
              type="text">
       <button class="btn-driver-save" onclick="openFolderBrowser()">Browse…</button>
       <button class="btn-driver-save" onclick="saveDriverPath()">Save Path</button>
