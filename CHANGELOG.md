@@ -239,6 +239,28 @@ each independently toggleable, collapsible cards for provider timing.
 
 ## HDHomeRun / DLNA Discovery
 
+### Added: HDHomeRun network discovery (UDP 65001)
+- 2026-11-18: apps that "find tuners" (Plex, Channels DVR, the HDHomeRun
+  app, libhdhomerun's `hdhomerun_config discover`) broadcast a discover
+  request to UDP 65001. Broadcast Hub now answers it like a real
+  HDHomeRun: device id, tuner count (the same number `/discover.json`
+  gives) and `BaseURL`/`LineupURL` with the `:6502` port, on whichever of
+  this machine's addresses the asker can reach. Malformed packets and
+  requests for other device types or ids are ignored. If the port is
+  taken, this logs a warning and nothing else is affected.
+- Requests from this machine itself are not answered. Jellyfin's
+  discovery ignores the reply's `BaseURL` and fetches
+  `http://<ip>/discover.json` on port 80; that is refused, Jellyfin logs
+  an error and stops listening for other tuners' replies. So Jellyfin
+  (running on the same machine) still adds Broadcast Hub by address,
+  `192.168.1.x:6502`.
+- Verified 2026-11-18: a broadcast from another machine gets Broadcast
+  Hub's reply next to a real HDHomeRun QUATRO's, in the same format; a
+  broadcast from this machine gets only the QUATRO's.
+- The device id (`10000001`) doesn't pass the checksum real HDHomeRun ids
+  carry. It was kept so existing setups don't see a new device; if a
+  libhdhomerun-based app skips Broadcast Hub in discovery, that's why.
+
 ### Replaced: HDHomeRun lineup now reflects real channels, not raw inputs
 - `/discover.json`, `/lineup.json`, `/lineup.xml` previously listed the
   raw physical capture inputs (`Board 0 · Input 1`, etc.), with URLs

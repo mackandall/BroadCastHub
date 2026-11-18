@@ -3293,10 +3293,14 @@ async def lifespan(app: FastAPI):
     # never prevents the rest of Broadcast Hub from starting normally.
     ssdp_transport = await _start_ssdp_listener()
     ssdp_announce_task = asyncio.create_task(_ssdp_announce_loop(ssdp_transport))
+    # HDHomeRun "find tuners" broadcasts (UDP 65001) — best-effort, like SSDP.
+    hdhr_discovery_transport = await _start_hdhr_discovery_listener()
 
     try:
         yield
     finally:
+        if hdhr_discovery_transport is not None:
+            hdhr_discovery_transport.close()
         stats_task.cancel()
         watchdog_task.cancel()
         schedule_task.cancel()
@@ -5898,10 +5902,13 @@ async def cc_activate(mode_uid: str):
 # Lets Plex, Channels DVR, Emby, and Jellyfin discover Broadcast Hub as a
 # network tuner and auto-build a channel list from active inputs, instead
 # of the user manually entering stream URLs. This is the HTTP half of the
-# HDHomeRun protocol only (discover.json / lineup.json / lineup_status.json)
-# — it does not implement UDP broadcast auto-discovery (port 65001), so
-# clients need to be pointed at this device's IP once (e.g. "Add tuner by
-# IP" in Plex/Channels/Emby), after which it behaves like a real HDHomeRun.
+# HDHomeRun protocol (discover.json / lineup.json / lineup_status.json); the
+# UDP broadcast auto-discovery half (port 65001) is _HDHRDiscoverProtocol
+# below. Note Jellyfin's own discovery ignores the reply's BaseURL and asks
+# http://<ip>/discover.json on port 80, so Jellyfin still needs the address
+# (with :6502) typed in once — and requests from this machine (where Jellyfin
+# runs) aren't answered, see _HDHRDiscoverProtocol. Plex/Channels/libhdhomerun
+# on other machines use the BaseURL.
 #
 # Purely additive: new GET routes only, reads existing input_config /
 # active_inputs state, does not touch the capture/distributor pipeline.
@@ -6082,6 +6089,159 @@ def _get_local_ip() -> str:
 
 
 _UPNP_LOCAL_IP = _get_local_ip()
+
+
+# ---------------------------------------------------------------------------
+# HDHomeRun UDP discovery (port 65001)
+# ---------------------------------------------------------------------------
+# The other half of looking like an HDHomeRun: apps that press "find tuners"
+# (Plex, Channels DVR, the HDHomeRun app, libhdhomerun's hdhomerun_config,
+# Jellyfin's Detect) broadcast a discover request to UDP 65001 and list every
+# device that answers. Packet = type (2 bytes) + payload length (2) + tags
+# (tag byte, length 1-2 bytes, value) + CRC32 of all of it, little-endian.
+# The reply carries the same device id, tuner count and URLs as discover.json.
+# Best-effort like SSDP: if the port is taken, this logs and does nothing.
+HDHR_DISCOVER_PORT = 65001
+_HDHR_TYPE_DISCOVER_REQ = 0x0002
+_HDHR_TYPE_DISCOVER_RPY = 0x0003
+_HDHR_TAG_DEVICE_TYPE = 0x01
+_HDHR_TAG_DEVICE_ID = 0x02
+_HDHR_TAG_TUNER_COUNT = 0x10
+_HDHR_TAG_LINEUP_URL = 0x27
+_HDHR_TAG_BASE_URL = 0x2A
+_HDHR_TAG_DEVICE_AUTH_STR = 0x2B
+_HDHR_DEVICE_TYPE_TUNER = 0x00000001
+_HDHR_WILDCARD = 0xFFFFFFFF
+
+
+def _hdhr_tag(tag: int, value: bytes) -> bytes:
+    n = len(value)
+    length = bytes([n]) if n <= 127 else bytes([(n & 0x7F) | 0x80, n >> 7])
+    return bytes([tag]) + length + value
+
+
+def _hdhr_packet(ptype: int, payload: bytes) -> bytes:
+    import zlib
+    frame = struct.pack(">HH", ptype, len(payload)) + payload
+    return frame + struct.pack("<I", zlib.crc32(frame) & 0xFFFFFFFF)
+
+
+def _hdhr_parse(data: bytes):
+    """(type, {tag: value}) for a well-formed packet with a good CRC, else None."""
+    import zlib
+    if len(data) < 8:
+        return None
+    ptype, plen = struct.unpack(">HH", data[:4])
+    if len(data) < 4 + plen + 4:
+        return None
+    frame = data[:4 + plen]
+    if struct.unpack("<I", data[4 + plen:8 + plen])[0] != (zlib.crc32(frame) & 0xFFFFFFFF):
+        return None
+    tags, pos = {}, 4
+    while pos < 4 + plen:
+        if pos + 2 > 4 + plen:
+            return None
+        tag, n = frame[pos], frame[pos + 1]
+        pos += 2
+        if n & 0x80:
+            if pos >= 4 + plen:
+                return None
+            n = (n & 0x7F) | (frame[pos] << 7)
+            pos += 1
+        tags[tag] = frame[pos:pos + n]
+        pos += n
+    return ptype, tags
+
+
+def _hdhr_local_ip_for(peer_ip: str) -> str:
+    """This machine's address on the asker's network (what it can reach us at)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect((peer_ip, HDHR_DISCOVER_PORT))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return _UPNP_LOCAL_IP
+
+
+def _hdhr_is_own_address(ip: str) -> bool:
+    """True for loopback and every IPv4 address on this machine's interfaces."""
+    if ip.startswith("127."):
+        return True
+    try:
+        return any(
+            a.family == socket.AF_INET and a.address == ip
+            for addrs in psutil.net_if_addrs().values() for a in addrs
+        )
+    except Exception:
+        return ip == _UPNP_LOCAL_IP
+
+
+class _HDHRDiscoverProtocol(asyncio.DatagramProtocol):
+    """Answers HDHomeRun discover requests for tuners (or any device type)."""
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data: bytes, addr):
+        parsed = _hdhr_parse(data)
+        if not parsed or parsed[0] != _HDHR_TYPE_DISCOVER_REQ:
+            return
+        if _hdhr_is_own_address(addr[0]):
+            # Asked from this machine — in practice Jellyfin, which runs here. Its discovery
+            # ignores the reply's BaseURL and fetches http://<ip>/discover.json on port 80;
+            # that is refused, it logs an error and stops listening for other tuners' replies.
+            # Jellyfin has Broadcast Hub added by address already, so don't answer it.
+            return
+        tags = parsed[1]
+        want_type = tags.get(_HDHR_TAG_DEVICE_TYPE)
+        if want_type and len(want_type) == 4 and struct.unpack(">I", want_type)[0] not in (_HDHR_DEVICE_TYPE_TUNER, _HDHR_WILDCARD):
+            return
+        device_id = int(HDHR_DEVICE_ID, 16)
+        want_id = tags.get(_HDHR_TAG_DEVICE_ID)
+        if want_id and len(want_id) == 4 and struct.unpack(">I", want_id)[0] not in (device_id, _HDHR_WILDCARD):
+            return
+
+        # Same tuner count discover.json reports: the general (provider) pool.
+        tuner_count = max(len(_get_tuner_pool(POOL_GENERAL)), 1)
+        base = f"http://{_hdhr_local_ip_for(addr[0])}:{UPNP_HTTP_PORT}"
+        payload = (
+            _hdhr_tag(_HDHR_TAG_DEVICE_TYPE, struct.pack(">I", _HDHR_DEVICE_TYPE_TUNER))
+            + _hdhr_tag(_HDHR_TAG_DEVICE_ID, struct.pack(">I", device_id))
+            + _hdhr_tag(_HDHR_TAG_TUNER_COUNT, bytes([min(tuner_count, 255)]))
+            + _hdhr_tag(_HDHR_TAG_DEVICE_AUTH_STR, b"broadcasthub")
+            + _hdhr_tag(_HDHR_TAG_BASE_URL, base.encode())
+            + _hdhr_tag(_HDHR_TAG_LINEUP_URL, f"{base}/lineup.json".encode())
+        )
+        try:
+            self.transport.sendto(_hdhr_packet(_HDHR_TYPE_DISCOVER_RPY, payload), addr)
+            log.info("HDHomeRun discovery: answered %s:%d (%s, %d tuner(s))", addr[0], addr[1], base, tuner_count)
+        except Exception as exc:
+            log.warning("HDHomeRun discovery reply to %s failed: %s", addr[0], exc)
+
+    def error_received(self, exc):
+        log.warning("HDHomeRun discovery listener error: %s", exc)
+
+
+async def _start_hdhr_discovery_listener():
+    """Listen on UDP 65001 for HDHomeRun discover broadcasts. Never fatal."""
+    try:
+        sock_ = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock_.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock_.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock_.bind(("", HDHR_DISCOVER_PORT))
+        sock_.setblocking(False)
+        loop = asyncio.get_running_loop()
+        transport, _protocol = await loop.create_datagram_endpoint(lambda: _HDHRDiscoverProtocol(), sock=sock_)
+        log.info("HDHomeRun discovery: listening on UDP %d", HDHR_DISCOVER_PORT)
+        return transport
+    except Exception as exc:
+        log.warning(
+            "HDHomeRun discovery: could not listen on UDP %d (%s) — apps must add "
+            "Broadcast Hub by its address; nothing else is affected.", HDHR_DISCOVER_PORT, exc,
+        )
+        return None
 
 
 class _SSDPProtocol(asyncio.DatagramProtocol):
