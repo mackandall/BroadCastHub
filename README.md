@@ -133,6 +133,21 @@ On first visit you will be prompted to set a password.
 
 ---
 
+## Adding Broadcast Hub to Jellyfin, Plex, Channels DVR or Emby
+
+Broadcast Hub looks like an HDHomeRun tuner to these apps. Two ways to add it:
+
+- **By address:** add an HDHomeRun tuner with `<your-machine-ip>:6502` (the port is required).
+- **Automatically:** on the Channels page, under **Network Discovery**, tick **Let apps find
+  Broadcast Hub automatically**. Broadcast Hub then also answers on port 80 — where these apps
+  look for HDHomeRuns when they search the network — so their "detect" / "find tuners" lists it
+  with its channels and tuner count. Opening port 80 needs a permission that `setup.sh` gives
+  the systemd service (`AmbientCapabilities=CAP_NET_BIND_SERVICE`); if you installed the service
+  some other way, add that line to it and restart Broadcast Hub. If the permission is missing,
+  the setting says so.
+
+---
+
 ## Automatic Driver Reinstallation
 
 The Magewell ProCapture driver is a kernel module that must be rebuilt after every kernel update. BroadcastHub handles this automatically:

@@ -1315,6 +1315,29 @@ def render_channels(all_ids: list, cfg: dict) -> str:
     <div id="stream-settings-status" style="font-size:10px;color:var(--muted);margin-top:8px"></div>
   </div>
 
+  <div class="section-header"><div class="section-lbl">&#128269; Network Discovery</div></div>
+  <div class="card">
+    <div style="display:flex;align-items:flex-start;gap:12px">
+      <input type="checkbox" id="hdhr-port80-toggle" style="margin-top:3px"
+        onchange="saveHdhrPort80()">
+      <div>
+        <label for="hdhr-port80-toggle" style="font-size:12px;font-weight:700;cursor:pointer">
+          Let apps find Broadcast Hub automatically (also serve on port 80)
+        </label>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px">
+          Apps that search the network for HDHomeRun tuners (Jellyfin's Detect, Channels DVR,
+          Emby) look for them on port 80, like a real HDHomeRun, and ignore the port Broadcast
+          Hub gives them. With this on, Broadcast Hub answers on port 80 as well as its usual
+          port, so those apps find it and add it with its channels and tuner count — no address
+          to type. Off: add it in each app by address, with the port (e.g. 192.168.1.x:6502).<br>
+          Needs permission to open port 80, which setup.sh gives the service. Apps that already
+          have Broadcast Hub may switch to the port-80 address when they next search; both work.
+        </div>
+        <div id="hdhr-port80-status" style="font-size:11px;margin-top:6px"></div>
+      </div>
+    </div>
+  </div>
+
   <div class="section-header">
     <div class="section-lbl">&#128225; Channels <span id="tuner-pool-info" style="font-weight:400;text-transform:none;letter-spacing:0;margin-left:8px"></span></div>
   </div>
@@ -1564,6 +1587,36 @@ def render_channels(all_ids: list, cfg: dict) -> str:
         if (intervalInput) intervalInput.value = data.stray_device_sweep_interval_secs;
       }}
     }} catch(e) {{}}
+  }}
+
+  function showHdhrPort80(data) {{
+    const box = document.getElementById('hdhr-port80-toggle');
+    const status = document.getElementById('hdhr-port80-status');
+    if (box) box.checked = !!data.enabled;
+    if (!status) return;
+    if (data.error) {{ status.style.color = 'var(--red, #e5534b)'; status.textContent = data.error; }}
+    else if (data.listening) {{ status.style.color = 'var(--green, #3fb950)'; status.textContent = 'Serving on port 80 — apps can find Broadcast Hub.'; }}
+    else {{ status.style.color = 'var(--muted)'; status.textContent = data.enabled ? 'Starting…' : 'Off — apps need the address of Broadcast Hub with :6502.'; }}
+  }}
+
+  async function loadHdhrPort80() {{
+    try {{
+      const data = await (await fetch('/hdhr/port80')).json();
+      if (data.ok) showHdhrPort80(data);
+    }} catch(e) {{}}
+  }}
+
+  async function saveHdhrPort80() {{
+    const box = document.getElementById('hdhr-port80-toggle');
+    const fd = new FormData();
+    fd.append('enabled', box.checked ? 'true' : 'false');
+    try {{
+      const data = await (await fetch('/hdhr/port80', {{method: 'POST', body: fd}})).json();
+      if (data.ok) {{
+        showHdhrPort80(data);
+        showToast(data.error ? 'Port 80 could not be opened' : (data.listening ? 'Serving on port 80' : 'Port 80 off'), !data.error);
+      }} else {{ showToast('Save failed', false); }}
+    }} catch(e) {{ showToast('Network error', false); }}
   }}
 
   async function saveStreamSettings() {{
@@ -1980,6 +2033,7 @@ def render_channels(all_ids: list, cfg: dict) -> str:
   loadTuning();
   loadProviderSettings();
   loadStreamSettings();
+  loadHdhrPort80();
 </script>
 </body>
 </html>"""

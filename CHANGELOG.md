@@ -239,6 +239,30 @@ each independently toggleable, collapsible cards for provider timing.
 
 ## HDHomeRun / DLNA Discovery
 
+### Added: "Let apps find Broadcast Hub automatically" (port 80) + a real device id
+- 2026-11-18: discovery alone wasn't enough. Jellyfin, Channels DVR and
+  Emby ignore the reply's `BaseURL` and fetch `http://<ip>/discover.json`
+  on port 80, like a real HDHomeRun.
+- New checkbox on the Channels page, **Network Discovery → Let apps find
+  Broadcast Hub automatically**: Broadcast Hub also serves the whole app
+  on port 80 (a second uvicorn server on the same app, so client
+  addresses stay real), switchable without a restart, remembered across
+  restarts. While it's on, discovery requests from this machine are
+  answered too. The page shows green when serving, or why it can't (no
+  permission, port in use).
+- Opening port 80 without root needs `CAP_NET_BIND_SERVICE`: `setup.sh`
+  now adds `AmbientCapabilities=CAP_NET_BIND_SERVICE` to the service.
+- The fixed device id `10000001` is gone. It sits in the range
+  libhdhomerun treats as first-generation "legacy" tuners with no web
+  server, so Channels DVR added Broadcast Hub with no lineup and never
+  fetched anything; it also failed HDHomeRun's id checksum. Each install
+  now generates its own id once (prefix `105`, valid checksum, kept in
+  `hdhr_device_id.txt`); a saved legacy id is replaced. Apps that knew
+  the old id see Broadcast Hub as a new device once.
+- Verified 2026-11-18: Channels DVR (restarted) added Broadcast Hub as a
+  regular HDHomeRun with 90 channels; Jellyfin's Detect lists
+  "Broadcast Hub · http://192.168.1.188" with no errors.
+
 ### Added: HDHomeRun network discovery (UDP 65001)
 - 2026-11-18: apps that "find tuners" (Plex, Channels DVR, the HDHomeRun
   app, libhdhomerun's `hdhomerun_config discover`) broadcast a discover

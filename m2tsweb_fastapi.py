@@ -3295,12 +3295,15 @@ async def lifespan(app: FastAPI):
     ssdp_announce_task = asyncio.create_task(_ssdp_announce_loop(ssdp_transport))
     # HDHomeRun "find tuners" broadcasts (UDP 65001) — best-effort, like SSDP.
     hdhr_discovery_transport = await _start_hdhr_discovery_listener()
+    if stream_settings.get("hdhr_port80", False):
+        await _port80_start()
 
     try:
         yield
     finally:
         if hdhr_discovery_transport is not None:
             hdhr_discovery_transport.close()
+        await _port80_stop()
         stats_task.cancel()
         watchdog_task.cancel()
         schedule_task.cancel()
@@ -5905,15 +5908,73 @@ async def cc_activate(mode_uid: str):
 # HDHomeRun protocol (discover.json / lineup.json / lineup_status.json); the
 # UDP broadcast auto-discovery half (port 65001) is _HDHRDiscoverProtocol
 # below. Note Jellyfin's own discovery ignores the reply's BaseURL and asks
-# http://<ip>/discover.json on port 80, so Jellyfin still needs the address
-# (with :6502) typed in once — and requests from this machine (where Jellyfin
-# runs) aren't answered, see _HDHRDiscoverProtocol. Plex/Channels/libhdhomerun
-# on other machines use the BaseURL.
+# http://<ip>/discover.json on port 80 (Channels DVR and Emby do the same), so
+# discovery only fully works with "Let apps find Broadcast Hub automatically"
+# on, which serves port 80 too (_port80_start). With it off, apps need the
+# address with :6502 typed in, and requests from this machine (where Jellyfin
+# runs) aren't answered — see _HDHRDiscoverProtocol.
 #
 # Purely additive: new GET routes only, reads existing input_config /
 # active_inputs state, does not touch the capture/distributor pipeline.
 
-HDHR_DEVICE_ID = "10000001"   # arbitrary but stable fake device ID
+# Device id: 8 hex digits, generated once per install and kept in hdhr_device_id.txt
+# (like upnp_uuid.txt) so apps see the same device across restarts and two Broadcast
+# Hubs on one network don't clash. It must look like a CURRENT HDHomeRun:
+# libhdhomerun (and Channels DVR) treat ids 0x100xxxxx below 0x10040000 and a few
+# other early-model prefixes as first-generation "legacy" tuners with no web server,
+# and never fetch discover.json from them — the old fixed id 10000001 was one of those.
+# It also carries HDHomeRun's id checksum (last digit), which some apps check.
+HDHR_DEVICE_ID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hdhr_device_id.txt")
+_HDHR_ID_LOOKUP = (0xA, 0x5, 0xF, 0x6, 0x7, 0xC, 0x1, 0xB, 0x9, 0x2, 0x8, 0xD, 0x4, 0x3, 0xE, 0x0)
+
+
+def _hdhr_id_checksum(device_id: int) -> int:
+    """libhdhomerun's device-id check: 0 for a valid id."""
+    c = 0
+    for i, shift in enumerate(range(28, -4, -4)):
+        nib = (device_id >> shift) & 0xF
+        c ^= _HDHR_ID_LOOKUP[nib] if i % 2 == 0 else nib
+    return c
+
+
+def _hdhr_id_is_legacy(device_id: int) -> bool:
+    """libhdhomerun's hdhomerun_discover_is_legacy: early models with no HTTP API."""
+    prefix = device_id >> 20
+    if prefix == 0x100:
+        return device_id < 0x10040000
+    if prefix == 0x120:
+        return device_id < 0x12030000
+    return prefix in (0x101, 0x102, 0x103, 0x111, 0x121, 0x122)
+
+
+def _hdhr_id_usable(device_id: int) -> bool:
+    return _hdhr_id_checksum(device_id) == 0 and not _hdhr_id_is_legacy(device_id)
+
+
+def _load_or_create_hdhr_device_id() -> str:
+    try:
+        with open(HDHR_DEVICE_ID_FILE) as f:
+            existing = f.read().strip().upper()
+        if re.fullmatch(r"[0-9A-F]{8}", existing) and _hdhr_id_usable(int(existing, 16)):
+            return existing
+    except (FileNotFoundError, ValueError):
+        pass
+    import random
+    # 0x105 prefix (not a legacy model) + 16 random bits + a nibble set for the checksum.
+    base = 0x10500000 | (random.SystemRandom().getrandbits(16) << 4)
+    device_id = base | _hdhr_id_checksum(base)
+    assert _hdhr_id_usable(device_id)
+    new_id = f"{device_id:08X}"
+    try:
+        with open(HDHR_DEVICE_ID_FILE, "w") as f:
+            f.write(new_id + "\n")
+    except Exception as exc:
+        log.warning("Could not save the HDHomeRun device id, a new one will be made at restart: %s", exc)
+    log.info("HDHomeRun device id: %s (new)", new_id)
+    return new_id
+
+
+HDHR_DEVICE_ID = _load_or_create_hdhr_device_id()
 HDHR_FRIENDLY_NAME = "Broadcast Hub"
 HDHR_MODEL_NUMBER  = "HDTC-2US"          # a real HDHomeRun model string
 HDHR_FIRMWARE_NAME = "hdhomerun3_atsc"
@@ -6165,6 +6226,103 @@ def _hdhr_local_ip_for(peer_ip: str) -> str:
         return _UPNP_LOCAL_IP
 
 
+# ---------------------------------------------------------------------------
+# Port 80 — "Let apps find Broadcast Hub automatically"
+# ---------------------------------------------------------------------------
+# Real HDHomeRuns serve HTTP on port 80, and the apps that discover them
+# (Jellyfin, Channels DVR, Emby) ignore the BaseURL in the discovery reply and
+# fetch http://<ip>/discover.json on port 80. With this on, Broadcast Hub also
+# serves its whole web app on port 80 (a second uvicorn server on the same app,
+# so client addresses stay real), and answers discovery from this machine too.
+# Opening a port below 1024 needs CAP_NET_BIND_SERVICE: setup.sh puts
+# AmbientCapabilities=CAP_NET_BIND_SERVICE in the service; nothing else needs root.
+HDHR_HTTP_PORT80 = 80
+_port80 = {"server": None, "task": None, "sock": None, "error": None}
+
+
+class _QuietServer(uvicorn.Server):
+    """A second uvicorn server inside the running app: no signal handlers of its
+    own (the main server keeps Ctrl+C / systemd stop), no app lifespan."""
+
+    def install_signal_handlers(self) -> None:
+        pass
+
+
+def _port80_active() -> bool:
+    return _port80["server"] is not None and not _port80["server"].should_exit
+
+
+async def _port80_start() -> str | None:
+    """Start serving on port 80. Returns None when listening, else why not."""
+    if _port80_active():
+        return None
+    try:
+        # Bind here first: uvicorn's own bind failure calls sys.exit, which would
+        # take the whole app down from inside a task.
+        sock_ = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock_.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock_.bind(("0.0.0.0", HDHR_HTTP_PORT80))
+        sock_.listen(128)
+        sock_.set_inheritable(True)
+    except PermissionError:
+        _port80["error"] = ("Broadcast Hub isn't allowed to open port 80. Run setup.sh again "
+                            "(it adds AmbientCapabilities=CAP_NET_BIND_SERVICE to the service), "
+                            "then restart Broadcast Hub.")
+        log.warning("Port 80: %s", _port80["error"])
+        return _port80["error"]
+    except OSError as exc:
+        _port80["error"] = f"Port 80 is already in use on this machine ({exc.strerror or exc})."
+        log.warning("Port 80: %s", _port80["error"])
+        return _port80["error"]
+    server = _QuietServer(uvicorn.Config(app, lifespan="off", log_config=None, access_log=True))
+    _port80.update(server=server, sock=sock_, error=None,
+                   task=asyncio.create_task(server.serve(sockets=[sock_])))
+    log.info("Port 80: serving Broadcast Hub on port 80 too (apps can find it automatically)")
+    return None
+
+
+async def _port80_stop() -> None:
+    server, task, sock_ = _port80["server"], _port80["task"], _port80["sock"]
+    _port80.update(server=None, task=None, sock=None)
+    if server is not None:
+        server.should_exit = True
+    if task is not None:
+        try:
+            await asyncio.wait_for(task, timeout=10)
+        except Exception:
+            task.cancel()
+    if sock_ is not None:
+        try:
+            sock_.close()
+        except Exception:
+            pass
+    if server is not None:
+        log.info("Port 80: stopped")
+
+
+@app.get("/hdhr/port80")
+async def hdhr_port80_get():
+    return JSONResponse({
+        "ok": True,
+        "enabled": bool(stream_settings.get("hdhr_port80", False)),
+        "listening": _port80_active(),
+        "error": _port80["error"],
+    })
+
+
+@app.post("/hdhr/port80")
+async def hdhr_port80_set(enabled: bool = Form(...)):
+    async with stream_settings_lock:
+        stream_settings["hdhr_port80"] = enabled
+        _save_stream_settings(stream_settings)
+    if enabled:
+        await _port80_start()
+    else:
+        _port80["error"] = None
+        await _port80_stop()
+    return await hdhr_port80_get()
+
+
 def _hdhr_is_own_address(ip: str) -> bool:
     """True for loopback and every IPv4 address on this machine's interfaces."""
     if ip.startswith("127."):
@@ -6188,11 +6346,12 @@ class _HDHRDiscoverProtocol(asyncio.DatagramProtocol):
         parsed = _hdhr_parse(data)
         if not parsed or parsed[0] != _HDHR_TYPE_DISCOVER_REQ:
             return
-        if _hdhr_is_own_address(addr[0]):
+        if _hdhr_is_own_address(addr[0]) and not _port80_active():
             # Asked from this machine — in practice Jellyfin, which runs here. Its discovery
             # ignores the reply's BaseURL and fetches http://<ip>/discover.json on port 80;
             # that is refused, it logs an error and stops listening for other tuners' replies.
-            # Jellyfin has Broadcast Hub added by address already, so don't answer it.
+            # Jellyfin has Broadcast Hub added by address already, so don't answer it —
+            # unless port 80 is served ("Let apps find Broadcast Hub automatically").
             return
         tags = parsed[1]
         want_type = tags.get(_HDHR_TAG_DEVICE_TYPE)

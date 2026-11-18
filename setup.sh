@@ -203,6 +203,9 @@ After=network.target
 [Service]
 Type=simple
 User=$REAL_USER
+# Lets Broadcast Hub open port 80 (Settings > Network Discovery, "Let apps find
+# Broadcast Hub automatically") without running as root.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 WorkingDirectory=$SCRIPT_DIR
 ExecStart=$(which python3) $SCRIPT_DIR/m2tsweb_fastapi.py
 Restart=on-failure
