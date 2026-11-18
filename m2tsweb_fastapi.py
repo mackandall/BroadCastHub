@@ -1142,6 +1142,21 @@ def _channel_pools(ch: dict) -> list:
     return [POOL_GENERAL]
 
 
+def _all_tuners_busy(ch: dict, channel_id: str) -> str | None:
+    """Why this channel can't get a tuner right now, or None if it can (or
+    might). Busy = every tuner in the channel's pools is active on another
+    channel. No tuners configured at all is left to the normal tune path,
+    which reports that case itself."""
+    candidates = [t for pool in _channel_pools(ch) for t in _get_tuner_pool(pool)]
+    if not candidates:
+        return None
+    for input_id, _ in candidates:
+        state = input_tuning_state.get(input_id, {})
+        if not state.get("active") or state.get("channel_id") == channel_id:
+            return None
+    return f"all {len(candidates)} tuner(s) this channel can use are busy"
+
+
 def _get_tuner_pool(pool: str | None = None) -> list:
     """Build the ordered tuner pool from existing input_config — any input
     with an ADB remote configured is a candidate tuner. Deliberately reuses
@@ -5593,6 +5608,20 @@ async def channel_stream(channel_id: str, request: Request):
     # reintroduce the slow-response problem fixed earlier.
     if stream_settings.get("same_client_eviction", SAME_CLIENT_EVICTION_DEFAULT):
         await _release_same_client_viewers(client_ip, channel_id)
+
+    # Every tuner this channel may use is already busy (and none is on this
+    # channel to share): refuse now the way a real HDHomeRun does — 503 with
+    # X-HDHomeRun-Error 805 "All Tuners In Use" — so Jellyfin and other DVRs
+    # stop at once with a clear "no tuner" instead of opening a stream that
+    # ends empty. A quick look without locks; if two requests race for the
+    # last tuner, the loser still gets the empty-stream path below.
+    busy_refusal = _all_tuners_busy(known, channel_id)
+    if busy_refusal:
+        log.warning("Channel stream: %s refused for %s: %s", channel_id, client_ip, busy_refusal)
+        return Response(
+            "805 All Tuners In Use\n", status_code=503, media_type="text/plain",
+            headers={"X-HDHomeRun-Error": "805 All Tuners In Use", "Retry-After": "30"},
+        )
 
     async def stream_from_queue():
         # KNOWN EDGE CASE, not yet fully handled: if the client disconnects

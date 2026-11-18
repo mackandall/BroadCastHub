@@ -9,6 +9,16 @@ system instead of raw physical inputs.
 
 ## Channel Tuning
 
+### Added: "All Tuners In Use" refusal, like a real HDHomeRun
+- 2026-11-18: when every tuner a channel may use was busy on other
+  channels, the stream still answered 200 at once and then ended empty, so
+  Jellyfin waited and failed with a vague "zero bytes" error.
+- A channel stream now checks first: if all of the channel's tuners are
+  busy and none is already on that channel, it answers 503 with
+  `X-HDHomeRun-Error: 805 All Tuners In Use` straight away. Sharing a
+  channel that is already tuned, and the instant 200 for normal tunes, are
+  unchanged. Logged as "Channel stream: … refused … busy".
+
 ### Added: FastChannels Player watch — restart a player that stopped mid-stream
 - 2026-10-14: a 30 s DirecTV CDN timeout left the player on "Source error"
   for the rest of the night. The capture card kept encoding the black
