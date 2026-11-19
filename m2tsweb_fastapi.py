@@ -2443,7 +2443,7 @@ _PUBLIC_PATHS = {
     "/health", "/login", "/setup", "/logout", "/favicon.ico",
     # HDHomeRun emulation — read by Plex/Channels/Emby/Jellyfin, which
     # cannot authenticate through Broadcast Hub's login form.
-    "/discover.json", "/lineup.json", "/lineup.xml", "/lineup_status.json",
+    "/discover.json", "/lineup.json", "/lineup.xml", "/lineup_status.json", "/status.json",
     # Channel M3U export — same reasoning, read by DVR clients directly.
     "/channels/export.m3u",
     "/fastchannels/playlist.m3u",
@@ -2466,6 +2466,7 @@ _PUBLIC_PREFIXES = (
 )
 
 _HDHR_TUNER_PATH = re.compile(r"^/tuner\d+/v[^/]+$")
+_HDHR_CORS_PATHS = {"/discover.json", "/lineup.json", "/lineup.xml", "/lineup_status.json", "/status.json"}
 
 _REAL_PAGE_PATHS = {"/", "/mobile", "/multiview", "/channels", "/logs", "/settings/password"}
 
@@ -2473,6 +2474,17 @@ async def _auth_middleware(request: Request, call_next):
     path = request.url.path
 
     # Always allow public paths
+    if path in _HDHR_CORS_PATHS or path.startswith("/auto/v") or _HDHR_TUNER_PATH.match(path):
+        # A real HDHomeRun sends Access-Control-Allow-Origin: * on everything.
+        # SiliconDust's own HDHomeRun app is a web app (WebKit on macOS): without
+        # this header the browser hides the answer ("TypeError: Load failed at
+        # .../discover.json"), and the app then reports "No HDHomeRun tuners
+        # found" for ALL tuners, real ones included. Public, read-only paths only.
+        response = await call_next(request)
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers.setdefault("Cache-Control", "no-cache")
+        return response
+
     if path in _PUBLIC_PATHS or any(path.startswith(p) for p in _PUBLIC_PREFIXES) \
             or _HDHR_TUNER_PATH.match(path):
         return await call_next(request)
@@ -6035,7 +6047,13 @@ async def hdhr_discover(request: Request):
         "FirmwareName":    HDHR_FIRMWARE_NAME,
         "FirmwareVersion": "20240101",
         "DeviceID":        HDHR_DEVICE_ID,
-        "DeviceAuth":      "broadcasthub",
+        # Empty, like the UDP discovery reply. SiliconDust's own HDHomeRun app
+        # joins every tuner's DeviceAuth into one string and sends it to its
+        # cloud ("Client Start"); a made-up value spoiled that string, the cloud
+        # rejected the whole list, and the app dropped the REAL HDHomeRuns too
+        # ("No HDHomeRun tuners found"). It skips empty ones, so the real tuners
+        # are approved and only Broadcast Hub is marked "no guide access" there.
+        "DeviceAuth":      "",
         "TunerCount":      max(tuner_count, 1),
         "BaseURL":         base,
         "LineupURL":       f"{base}/lineup.json",
@@ -6078,6 +6096,19 @@ def _hdhr_lineup_urls(chs: dict, request: Request) -> dict:
     return urls
 
 
+def _hdhr_video_codec() -> str:
+    """The lineup's VideoCodec, as a real HDHomeRun names it (MPEG2/H264/HEVC),
+    from the encoder of the first tuner in the general pool. SiliconDust's app
+    reads VideoCodec/AudioCodec/HD on every channel."""
+    tuners = _get_tuner_pool(POOL_GENERAL)
+    encoder = (input_config.get(tuners[0][0], {}).get("encoder", "") if tuners else "").lower()
+    if encoder.startswith(("hevc", "libx265")):
+        return "HEVC"
+    if encoder.startswith("av1"):
+        return "AV1"
+    return "H264"
+
+
 async def _hdhr_stream_by_number(guide_number: str, request: Request, tuner: str):
     async with channels_config_lock:
         channel_id = _guide_number_owner(channels_config, guide_number)
@@ -6111,6 +6142,31 @@ async def hdhr_tuner_stream(tuner_index: int, guide_number: str, request: Reques
     return await _hdhr_stream_by_number(guide_number, request, f"tuner{tuner_index}")
 
 
+@app.get("/status.json")
+async def hdhr_status():
+    """Per-tuner status, like a real HDHomeRun's /status.json (SiliconDust's app
+    and Channels DVR read it): one entry per tuner in discover.json's count;
+    a busy one also says which channel and who is watching."""
+    async with input_config_lock:
+        tuners = _get_tuner_pool(POOL_GENERAL)
+    async with channels_config_lock:
+        chs = dict(channels_config)
+    status = []
+    for index, (input_id, _) in enumerate(tuners or [(None, None)]):
+        entry = {"Resource": f"tuner{index}"}
+        state = input_tuning_state.get(input_id, {}) if input_id else {}
+        channel_id = state.get("channel_id")
+        if state.get("active") and channel_id:
+            ch = chs.get(channel_id, {})
+            entry["VctNumber"] = _guide_number_of(channel_id, ch) if ch else channel_id
+            entry["VctName"] = ch.get("display_name", channel_id)
+            viewers = active_inputs.get(input_id, {}).get("viewers", [])
+            if viewers:
+                entry["TargetIP"] = viewers[0].get("ip", "")
+        status.append(entry)
+    return JSONResponse(status)
+
+
 @app.get("/lineup_status.json")
 async def hdhr_lineup_status():
     return JSONResponse({
@@ -6137,6 +6193,8 @@ async def hdhr_lineup(request: Request):
     async with channels_config_lock:
         chs = dict(channels_config)
     urls = _hdhr_lineup_urls(chs, request)
+    async with input_config_lock:
+        video_codec = _hdhr_video_codec()
 
     lineup = []
     for channel_id, ch in chs.items():
@@ -6145,6 +6203,9 @@ async def hdhr_lineup(request: Request):
         lineup.append({
             "GuideNumber": _guide_number_of(channel_id, ch),
             "GuideName":   ch.get("display_name", channel_id),
+            "VideoCodec":  video_codec,
+            "AudioCodec":  "AC3",   # magewell2ts' audio (-a 5): AC-3
+            "HD":          1,
             "URL":         urls[channel_id],
         })
     return JSONResponse(lineup)
@@ -6501,7 +6562,8 @@ class _HDHRDiscoverProtocol(asyncio.DatagramProtocol):
             _hdhr_tag(_HDHR_TAG_DEVICE_TYPE, struct.pack(">I", _HDHR_DEVICE_TYPE_TUNER))
             + _hdhr_tag(_HDHR_TAG_DEVICE_ID, struct.pack(">I", device_id))
             + _hdhr_tag(_HDHR_TAG_TUNER_COUNT, bytes([min(tuner_count, 255)]))
-            + _hdhr_tag(_HDHR_TAG_DEVICE_AUTH_STR, b"broadcasthub")
+            # No DeviceAuth tag: Broadcast Hub has no SiliconDust cloud key, and a
+            # made-up one makes SiliconDust's app drop every tuner (see discover.json).
             + _hdhr_tag(_HDHR_TAG_BASE_URL, base.encode())
             + _hdhr_tag(_HDHR_TAG_LINEUP_URL, f"{base}/lineup.json".encode())
         )

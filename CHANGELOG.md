@@ -9,6 +9,23 @@ system instead of raw physical inputs.
 
 ## Channel Tuning
 
+### Fixed: SiliconDust's HDHomeRun app lost ALL tuners while Broadcast Hub was on
+- 2026-11-18: with discovery on, the HDHomeRun app (macOS) said "No
+  HDHomeRun tuners found" and the real QUATRO became unusable too. Two
+  causes, found in the app's own code:
+  - No `Access-Control-Allow-Origin: *` header. The app is a web app, so
+    WebKit hid Broadcast Hub's answers ("TypeError: Load failed at
+    .../discover.json"). Now sent on the HDHomeRun paths (discover.json,
+    lineup.json/.xml, lineup_status.json, status.json, /auto, /tuner), like
+    a real HDHomeRun; the login-protected pages don't get it.
+  - The made-up `DeviceAuth` "broadcasthub". The app joins every tuner's
+    DeviceAuth and sends it to SiliconDust's cloud; the bad value spoiled
+    the whole list, so every tuner was dropped as "no guide access". Now
+    empty in discover.json and left out of the UDP discovery reply: the
+    real tuners are approved and only Broadcast Hub shows "no guide".
+- Also added: `/status.json` (per-tuner status like a real HDHomeRun) and
+  VideoCodec/AudioCodec/HD on each lineup.json channel.
+
 ### Added: HDHomeRun stream port 5004 (`/auto/v<number>`, `/tuner<n>/v<number>`)
 - 2026-11-18: NextPVR found Broadcast Hub as an HDHomeRun (after the real
   device id) but said "No tuner was available": it streams from
