@@ -9,6 +9,20 @@ system instead of raw physical inputs.
 
 ## Channel Tuning
 
+### Added: HDHomeRun stream port 5004 (`/auto/v<number>`, `/tuner<n>/v<number>`)
+- 2026-11-18: NextPVR found Broadcast Hub as an HDHomeRun (after the real
+  device id) but said "No tuner was available": it streams from
+  `http://<ip>:5004/tuner3/v204` like it would from a real unit, and nothing
+  answered on port 5004.
+- With "Let apps find Broadcast Hub automatically" on, port 5004 is served
+  too, with both routes. They find the channel by its number and use the
+  same tuning, sharing and 805 refusal as `/channel/<id>/stream`; Broadcast
+  Hub still picks the box itself for `/tuner<n>`. lineup.json/.xml then
+  point at `http://<ip>:5004/auto/v<number>`, as a real HDHomeRun's do;
+  with the setting off they keep the `/channel/<id>/stream` URLs.
+- Two enabled channels can no longer share a number: saving or enabling one
+  is refused with the name of the channel that has it.
+
 ### Added: "All Tuners In Use" refusal, like a real HDHomeRun
 - 2026-11-18: when every tuner a channel may use was busy on other
   channels, the stream still answered 200 at once and then ended empty, so

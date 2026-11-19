@@ -146,6 +146,13 @@ Broadcast Hub looks like an HDHomeRun tuner to these apps. Two ways to add it:
   some other way, add that line to it and restart Broadcast Hub. If the permission is missing,
   the setting says so.
 
+With that setting on, Broadcast Hub also serves a real HDHomeRun's stream port, **5004**:
+`http://<ip>:5004/auto/v<number>` (any free tuner) and `/tuner<n>/v<number>` (what NextPVR and
+Kodi use). The lineup then hands every app the `/auto/v<number>` URLs, so all apps stream the
+same way. Channels are found by their **channel number**, so two enabled channels can't share
+one (give the second `4501.1`, say). Changing what a channel tunes, its number or its guide
+station id stays a Channels-page edit; apps pick it up on their next lineup/guide refresh.
+
 ---
 
 ## Automatic Driver Reinstallation

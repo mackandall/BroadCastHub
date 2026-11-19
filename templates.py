@@ -1331,7 +1331,11 @@ def render_channels(all_ids: list, cfg: dict) -> str:
           port, so those apps find it and add it with its channels and tuner count — no address
           to type. Off: add it in each app by address, with the port (e.g. 192.168.1.x:6502).<br>
           Needs permission to open port 80, which setup.sh gives the service. Apps that already
-          have Broadcast Hub may switch to the port-80 address when they next search; both work.
+          have Broadcast Hub may switch to the port-80 address when they next search; both work.<br>
+          Also serves the stream port of a real HDHomeRun, 5004 (<code>/auto/v&lt;number&gt;</code>,
+          <code>/tuner&lt;n&gt;/v&lt;number&gt;</code>), which NextPVR and Kodi use, and the lineup then
+          points every app at those URLs. Channels are found by their channel number, so two
+          enabled channels can't share one.
         </div>
         <div id="hdhr-port80-status" style="font-size:11px;margin-top:6px"></div>
       </div>
@@ -1595,6 +1599,7 @@ def render_channels(all_ids: list, cfg: dict) -> str:
     if (box) box.checked = !!data.enabled;
     if (!status) return;
     if (data.error) {{ status.style.color = 'var(--red, #e5534b)'; status.textContent = data.error; }}
+    else if (data.listening && data.stream_port_listening) {{ status.style.color = 'var(--green, #3fb950)'; status.textContent = `Serving on ports 80 and ${{data.stream_port}} — apps can find Broadcast Hub and stream from it.`; }}
     else if (data.listening) {{ status.style.color = 'var(--green, #3fb950)'; status.textContent = 'Serving on port 80 — apps can find Broadcast Hub.'; }}
     else {{ status.style.color = 'var(--muted)'; status.textContent = data.enabled ? 'Starting…' : 'Off — apps need the address of Broadcast Hub with :6502.'; }}
   }}

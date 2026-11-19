@@ -2459,7 +2459,13 @@ _PUBLIC_PREFIXES = (
     # (plural) — the plural prefix is the channel *management* API
     # (save/delete/import) and must stay behind login.
     "/channel/",
+    # HDHomeRun-style stream routes (/auto/v204, /tuner2/v204) — what a real
+    # HDHomeRun serves on port 5004; NextPVR, Kodi and libhdhomerun apps build
+    # these themselves. Same tune-then-stream path as /channel/.
+    "/auto/v",
 )
+
+_HDHR_TUNER_PATH = re.compile(r"^/tuner\d+/v[^/]+$")
 
 _REAL_PAGE_PATHS = {"/", "/mobile", "/multiview", "/channels", "/logs", "/settings/password"}
 
@@ -2467,7 +2473,8 @@ async def _auth_middleware(request: Request, call_next):
     path = request.url.path
 
     # Always allow public paths
-    if path in _PUBLIC_PATHS or any(path.startswith(p) for p in _PUBLIC_PREFIXES):
+    if path in _PUBLIC_PATHS or any(path.startswith(p) for p in _PUBLIC_PREFIXES) \
+            or _HDHR_TUNER_PATH.match(path):
         return await call_next(request)
 
     # If no password has been set yet, force setup
@@ -4866,6 +4873,19 @@ async def channels_list():
     })
 
 
+def _guide_number_clash(channel_id: str, guide_number: str) -> str | None:
+    """Why this channel can't be enabled with this number (call with
+    channels_config_lock held): apps find a channel by its number alone
+    (lineup, and the HDHomeRun /auto/v<number> stream URL), so two enabled
+    channels can't share one."""
+    owner = _guide_number_owner(channels_config, guide_number, skip=channel_id)
+    if owner is None:
+        return None
+    name = channels_config[owner].get("display_name", owner)
+    return (f"Channel number {guide_number} is already used by {name}. Give this channel another "
+            f"number (for example {guide_number}.1), or disable {name} first.")
+
+
 @app.post("/channels/save")
 async def channels_save(
     channel_id:   str = Form(...),
@@ -4893,6 +4913,10 @@ async def channels_save(
     if provider not in PROVIDER_PROFILES:
         return JSONResponse({"ok": False, "error": f"Unknown provider: {provider}"}, status_code=400)
     async with channels_config_lock:
+        if enabled:
+            clash = _guide_number_clash(channel_id, guide_number.strip() or channel_id)
+            if clash:
+                return JSONResponse({"ok": False, "error": clash}, status_code=409)
         previous = channels_config.get(channel_id, {})
         channels_config[channel_id] = {
             "display_name":     display_name.strip() or channel_id,
@@ -4934,6 +4958,10 @@ async def channels_toggle(channel_id: str):
         if channel_id not in channels_config:
             return JSONResponse({"ok": False, "error": f"Unknown channel_id: {channel_id}"}, status_code=404)
         current = channels_config[channel_id].get("enabled", True)
+        if not current:
+            clash = _guide_number_clash(channel_id, _guide_number_of(channel_id, channels_config[channel_id]))
+            if clash:
+                return JSONResponse({"ok": False, "error": clash}, status_code=409)
         channels_config[channel_id]["enabled"] = not current
         _save_channels_config(channels_config)
         new_state = channels_config[channel_id]["enabled"]
@@ -6014,6 +6042,75 @@ async def hdhr_discover(request: Request):
     })
 
 
+def _guide_number_of(channel_id: str, ch: dict) -> str:
+    """The number apps see for a channel (falls back to its id)."""
+    return (ch.get("guide_number") or "").strip() or channel_id
+
+
+def _guide_number_owner(chs: dict, guide_number: str, skip: str | None = None) -> str | None:
+    """The enabled channel that answers to this guide number, if any. With
+    several (which saving now refuses), the first one in channels.json."""
+    for channel_id, ch in chs.items():
+        if channel_id != skip and ch.get("enabled", True) and _guide_number_of(channel_id, ch) == guide_number:
+            return channel_id
+    return None
+
+
+def _hdhr_lineup_urls(chs: dict, request: Request) -> dict:
+    """Each enabled channel's stream URL for lineup.json/.xml. While port 5004
+    is served (with "Let apps find Broadcast Hub automatically"), these are a
+    real HDHomeRun's own URLs, http://<ip>:5004/auto/v<number>, so every app
+    streams the same way. Otherwise — and for a second channel that shares a
+    number — the /channel/<id>/stream URL, which always works."""
+    base = _hdhr_base_url(request)
+    host = request.url.hostname or "127.0.0.1"
+    use_5004 = _stream_port_active()
+    urls, seen = {}, set()
+    for channel_id, ch in chs.items():
+        if not ch.get("enabled", True):
+            continue
+        number = _guide_number_of(channel_id, ch)
+        if use_5004 and number not in seen:
+            urls[channel_id] = f"http://{host}:{HDHR_STREAM_PORT}/auto/v{_url_quote(number, safe='.')}"
+        else:
+            urls[channel_id] = f"{base}/channel/{_url_quote(channel_id, safe=':')}/stream"
+        seen.add(number)
+    return urls
+
+
+async def _hdhr_stream_by_number(guide_number: str, request: Request, tuner: str):
+    async with channels_config_lock:
+        channel_id = _guide_number_owner(channels_config, guide_number)
+    client_ip = request.client.host if request.client else "unknown"
+    if channel_id is None:
+        log.warning("HDHomeRun stream: %s/v%s from %s: no enabled channel has that number", tuner, guide_number, client_ip)
+        return Response("Unknown channel\n", status_code=404, media_type="text/plain")
+    log.info("HDHomeRun stream: %s/v%s -> channel %s for %s", tuner, guide_number, channel_id, client_ip)
+    return await channel_stream(channel_id, request)
+
+
+@app.get("/auto/v{guide_number}")
+async def hdhr_auto_stream(guide_number: str, request: Request):
+    """A real HDHomeRun's "any free tuner" stream URL (the one its lineup
+    hands out). Same tuning, sharing and 805 refusal as /channel/<id>/stream."""
+    return await _hdhr_stream_by_number(guide_number, request, "auto")
+
+
+@app.get("/tuner{tuner_index:int}/v{guide_number}")
+async def hdhr_tuner_stream(tuner_index: int, guide_number: str, request: Request):
+    """A real HDHomeRun's "this tuner" stream URL — NextPVR uses these, one per
+    tuner it was told about. Broadcast Hub still picks the box itself (any free
+    tuner, or the one already on this channel), so the app's tuner numbers never
+    have to match Broadcast Hub's inputs or what Jellyfin is using; when all are
+    busy it refuses with 805 like a real tuner would, and the app tries its next.
+    A number past the tuner count is refused as unknown."""
+    async with input_config_lock:
+        count = max(len(_get_tuner_pool(POOL_GENERAL)), 1)
+    if tuner_index >= count:
+        return Response("Unknown tuner\n", status_code=404, media_type="text/plain")
+    return await _hdhr_stream_by_number(guide_number, request, f"tuner{tuner_index}")
+
+
 @app.get("/lineup_status.json")
 async def hdhr_lineup_status():
     return JSONResponse({
@@ -6037,18 +6134,18 @@ async def hdhr_lineup(request: Request):
     M3U source) can discover and use the full channel-tuning pipeline
     directly, with real guide numbers and names, no M3U import needed.
     """
-    base = _hdhr_base_url(request)
     async with channels_config_lock:
         chs = dict(channels_config)
+    urls = _hdhr_lineup_urls(chs, request)
 
     lineup = []
     for channel_id, ch in chs.items():
         if not ch.get("enabled", True):
             continue
         lineup.append({
-            "GuideNumber": ch.get("guide_number", "") or channel_id,
+            "GuideNumber": _guide_number_of(channel_id, ch),
             "GuideName":   ch.get("display_name", channel_id),
-            "URL":         f"{base}/channel/{channel_id}/stream",
+            "URL":         urls[channel_id],
         })
     return JSONResponse(lineup)
 
@@ -6058,22 +6155,22 @@ async def hdhr_lineup_xml(request: Request):
     """Some clients request the XML form of the lineup instead of JSON.
     REPLACED to match lineup.json's new channels-based source — see that
     route's docstring for why."""
-    base = _hdhr_base_url(request)
     async with channels_config_lock:
         chs = dict(channels_config)
+    urls = _hdhr_lineup_urls(chs, request)
 
     import xml.sax.saxutils as _sax
     rows = []
     for channel_id, ch in chs.items():
         if not ch.get("enabled", True):
             continue
-        guide_number = ch.get("guide_number", "") or channel_id
+        guide_number = _guide_number_of(channel_id, ch)
         guide_name   = ch.get("display_name", channel_id)
         rows.append(
             "  <Program>\n"
             f"    <GuideNumber>{_sax.escape(guide_number)}</GuideNumber>\n"
             f"    <GuideName>{_sax.escape(guide_name)}</GuideName>\n"
-            f"    <URL>{_sax.escape(base)}/channel/{_sax.escape(channel_id)}/stream</URL>\n"
+            f"    <URL>{_sax.escape(urls[channel_id])}</URL>\n"
             "  </Program>"
         )
     xml_body = "<Lineup>\n" + "\n".join(rows) + "\n</Lineup>"
@@ -6237,7 +6334,15 @@ def _hdhr_local_ip_for(peer_ip: str) -> str:
 # Opening a port below 1024 needs CAP_NET_BIND_SERVICE: setup.sh puts
 # AmbientCapabilities=CAP_NET_BIND_SERVICE in the service; nothing else needs root.
 HDHR_HTTP_PORT80 = 80
-_port80 = {"server": None, "task": None, "sock": None, "error": None}
+# A real HDHomeRun streams on port 5004 (http://<ip>:5004/auto/v<number> and
+# /tuner<n>/v<number>). Served with the same switch as port 80: apps that find
+# Broadcast Hub as an HDHomeRun (NextPVR, Kodi) build those URLs themselves.
+HDHR_STREAM_PORT = 5004
+_extra_ports = {
+    port: {"server": None, "task": None, "sock": None, "error": None}
+    for port in (HDHR_HTTP_PORT80, HDHR_STREAM_PORT)
+}
+_port80 = _extra_ports[HDHR_HTTP_PORT80]
 
 
 class _QuietServer(uvicorn.Server):
@@ -6248,42 +6353,53 @@ class _QuietServer(uvicorn.Server):
         pass
 
 
+def _extra_port_active(port: int) -> bool:
+    state = _extra_ports[port]
+    return state["server"] is not None and not state["server"].should_exit
+
+
 def _port80_active() -> bool:
-    return _port80["server"] is not None and not _port80["server"].should_exit
+    return _extra_port_active(HDHR_HTTP_PORT80)
 
 
-async def _port80_start() -> str | None:
-    """Start serving on port 80. Returns None when listening, else why not."""
-    if _port80_active():
+def _stream_port_active() -> bool:
+    return _extra_port_active(HDHR_STREAM_PORT)
+
+
+async def _extra_port_start(port: int) -> str | None:
+    """Serve the app on one more port. Returns None when listening, else why not."""
+    state = _extra_ports[port]
+    if _extra_port_active(port):
         return None
     try:
         # Bind here first: uvicorn's own bind failure calls sys.exit, which would
         # take the whole app down from inside a task.
         sock_ = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock_.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock_.bind(("0.0.0.0", HDHR_HTTP_PORT80))
+        sock_.bind(("0.0.0.0", port))
         sock_.listen(128)
         sock_.set_inheritable(True)
     except PermissionError:
-        _port80["error"] = ("Broadcast Hub isn't allowed to open port 80. Run setup.sh again "
-                            "(it adds AmbientCapabilities=CAP_NET_BIND_SERVICE to the service), "
-                            "then restart Broadcast Hub.")
-        log.warning("Port 80: %s", _port80["error"])
-        return _port80["error"]
+        state["error"] = (f"Broadcast Hub isn't allowed to open port {port}. Run setup.sh again "
+                          "(it adds AmbientCapabilities=CAP_NET_BIND_SERVICE to the service), "
+                          "then restart Broadcast Hub.")
+        log.warning("Port %s: %s", port, state["error"])
+        return state["error"]
     except OSError as exc:
-        _port80["error"] = f"Port 80 is already in use on this machine ({exc.strerror or exc})."
-        log.warning("Port 80: %s", _port80["error"])
-        return _port80["error"]
+        state["error"] = f"Port {port} is already in use on this machine ({exc.strerror or exc})."
+        log.warning("Port %s: %s", port, state["error"])
+        return state["error"]
     server = _QuietServer(uvicorn.Config(app, lifespan="off", log_config=None, access_log=True))
-    _port80.update(server=server, sock=sock_, error=None,
-                   task=asyncio.create_task(server.serve(sockets=[sock_])))
-    log.info("Port 80: serving Broadcast Hub on port 80 too (apps can find it automatically)")
+    state.update(server=server, sock=sock_, error=None,
+                 task=asyncio.create_task(server.serve(sockets=[sock_])))
+    log.info("Port %s: serving Broadcast Hub on port %s too", port, port)
     return None
 
 
-async def _port80_stop() -> None:
-    server, task, sock_ = _port80["server"], _port80["task"], _port80["sock"]
-    _port80.update(server=None, task=None, sock=None)
+async def _extra_port_stop(port: int) -> None:
+    state = _extra_ports[port]
+    server, task, sock_ = state["server"], state["task"], state["sock"]
+    state.update(server=None, task=None, sock=None)
     if server is not None:
         server.should_exit = True
     if task is not None:
@@ -6297,7 +6413,20 @@ async def _port80_stop() -> None:
         except Exception:
             pass
     if server is not None:
-        log.info("Port 80: stopped")
+        log.info("Port %s: stopped", port)
+
+
+async def _port80_start() -> str | None:
+    """"Let apps find Broadcast Hub automatically": port 80 (discovery, lineup)
+    and port 5004 (HDHomeRun stream URLs). Returns the first error, if any."""
+    err80 = await _extra_port_start(HDHR_HTTP_PORT80)
+    err5004 = await _extra_port_start(HDHR_STREAM_PORT)
+    return err80 or err5004
+
+
+async def _port80_stop() -> None:
+    await _extra_port_stop(HDHR_STREAM_PORT)
+    await _extra_port_stop(HDHR_HTTP_PORT80)
 
 
 @app.get("/hdhr/port80")
@@ -6306,7 +6435,9 @@ async def hdhr_port80_get():
         "ok": True,
         "enabled": bool(stream_settings.get("hdhr_port80", False)),
         "listening": _port80_active(),
-        "error": _port80["error"],
+        "stream_port_listening": _stream_port_active(),
+        "stream_port": HDHR_STREAM_PORT,
+        "error": _extra_ports[HDHR_HTTP_PORT80]["error"] or _extra_ports[HDHR_STREAM_PORT]["error"],
     })
 
 
@@ -6318,7 +6449,8 @@ async def hdhr_port80_set(enabled: bool = Form(...)):
     if enabled:
         await _port80_start()
     else:
-        _port80["error"] = None
+        for state in _extra_ports.values():
+            state["error"] = None
         await _port80_stop()
     return await hdhr_port80_get()
 
